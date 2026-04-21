@@ -25,7 +25,8 @@ from vit_onnx_trt import Preprocss
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm import logger
-from tensorrt_llm.bindings import KVCacheType
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import (ModelConfig, SamplingConfig, Session,
                                   TensorInfo)
@@ -118,8 +119,7 @@ class QWenInfer(object):
         num_kv_heads = config["pretrained_config"].get("num_key_value_heads",
                                                        num_heads)
         if "kv_cache_type" in config["build_config"]:
-            kv_cache_type = KVCacheType.from_string(
-                config["build_config"]["kv_cache_type"])
+            kv_cache_type = KVCacheType(config["build_config"]["kv_cache_type"])
         else:
             kv_cache_type = KVCacheType.CONTINUOUS
 
@@ -525,6 +525,7 @@ def vit_process(image_path, vit_engine_path, stream):
 
 
 if __name__ == "__main__":
+    emit_engine_arch_deprecation("run.py")
     args = parse_arguments()
     stream = torch.cuda.current_stream().cuda_stream
     tensorrt_llm.logger.set_level(args.log_level)

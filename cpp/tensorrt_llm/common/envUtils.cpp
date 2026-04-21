@@ -16,6 +16,7 @@
  */
 
 #include "envUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
@@ -25,7 +26,9 @@
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 std::optional<int32_t> getIntEnv(char const* name)
@@ -246,7 +249,7 @@ bool getEnvUseTileSizeKv64ForTrtllmGen()
 bool getEnvEnablePDL()
 {
     static std::once_flag flag;
-    static bool enablePDL = false;
+    static bool enablePDL = true;
 
     std::call_once(flag,
         [&]()
@@ -254,10 +257,30 @@ bool getEnvEnablePDL()
             if (getSMVersion() >= 90)
             {
                 // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
-                enablePDL = getBoolEnv("TRTLLM_ENABLE_PDL");
+                char const* env = std::getenv("TRTLLM_ENABLE_PDL");
+                if (env)
+                {
+                    if (env[0] == '1' && env[1] == '\0')
+                    {
+                        enablePDL = true;
+                    }
+                    else if (env[0] == '0' && env[1] == '\0')
+                    {
+                        enablePDL = false;
+                    }
+                };
             }
         });
     return enablePDL;
+}
+
+bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
+{
+    static std::once_flag flag;
+    static bool enabled = false;
+
+    std::call_once(flag, [&]() { enabled = getBoolEnv("TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL"); });
+    return enabled;
 }
 
 bool getEnvUseUCXKvCache()
@@ -276,6 +299,12 @@ bool getEnvUseNixlKvCache()
 {
     static bool const useNixlKvCache = getBoolEnv("TRTLLM_USE_NIXL_KVCACHE");
     return useNixlKvCache;
+}
+
+bool getEnvUseMooncakeKvCache()
+{
+    static bool const useMooncakeKvCache = getBoolEnv("TRTLLM_USE_MOONCAKE_KVCACHE");
+    return useMooncakeKvCache;
 }
 
 std::string getEnvUCXInterface()
@@ -310,6 +339,45 @@ std::string getEnvNixlInterface()
             }
         });
     return nixlInterface;
+}
+
+std::string getEnvNixlBackend()
+{
+    static std::once_flag flag;
+    static std::string nixlBackend;
+
+    std::call_once(flag,
+        [&]()
+        {
+            char const* nixl_backend = std::getenv("TRTLLM_NIXL_KVCACHE_BACKEND");
+            if (nixl_backend)
+            {
+                nixlBackend = nixl_backend;
+            }
+            else
+            {
+                // Default to UCX if not specified
+                nixlBackend = "UCX";
+            }
+        });
+    return nixlBackend;
+}
+
+std::string getEnvMooncakeInterface()
+{
+    static std::once_flag flag;
+    static std::string mooncakeInterface;
+
+    std::call_once(flag,
+        [&]()
+        {
+            char const* mooncake_interface = std::getenv("TRTLLM_MOONCAKE_INTERFACE");
+            if (mooncake_interface)
+            {
+                mooncakeInterface = mooncake_interface;
+            }
+        });
+    return mooncakeInterface;
 }
 
 bool getEnvDisaggLayerwise()
@@ -380,7 +448,7 @@ size_t getEnvAllReduceWorkspaceSize()
     return workspaceSize;
 }
 
-std::string const& getEnvKVCacheTransferOutputPath()
+std::string const& getEnvKVCacheTimeOutputPath()
 {
     static std::string outputPath = getStrEnv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH").value_or("");
     return outputPath;
@@ -446,6 +514,12 @@ uint16_t getEnvNixlPort()
     return nixlPort;
 }
 
+bool getEnvNixlEnableCoalesce()
+{
+    static bool const enableCoalesce = getBoolEnv("TRTLLM_NIXL_ENABLE_COALESCE");
+    return enableCoalesce;
+}
+
 bool getEnvDisaggBenchmarkGenOnly()
 {
     return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY");
@@ -495,4 +569,16 @@ int getEnvMoeA2ACombineBlockSize()
     return kBlock;
 }
 
-} // namespace tensorrt_llm::common
+bool getEnvEplbForceGdrcopy()
+{
+    return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
+}
+
+bool getEnvPrintSkipSoftmaxStat()
+{
+    return getBoolEnv("TRTLLM_PRINT_SKIP_SOFTMAX_STAT");
+}
+
+} // namespace common
+
+TRTLLM_NAMESPACE_END

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,11 +39,13 @@
 #include "mxfp8_mxfp4_gemm_template_sm100.h"
 #include "nvfp4_nvfp4_gemm_template_sm100.h"
 #include "nvfp4_nvfp4_gemm_template_sm120.h"
+
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -204,6 +206,11 @@ size_t dispatchNVFP4xNVFP4GemmCTAShapeSm120(T* D, void const* A, void const* B, 
 
     switch (gemmConfig.tile_config_sm120)
     {
+    case tkc::CutlassTileConfigSM120::CtaShape128x128x128B:
+        return dispatchNVFP4xNVFP4GemmClusterShapeSm120<T, cute::Int<128>, cute::Int<128>, cute::Int<128>>(D, A, B,
+            input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream,
+            occupancy);
+        break;
     case tkc::CutlassTileConfigSM120::CtaShape128x128x256B:
         return dispatchNVFP4xNVFP4GemmClusterShapeSm120<T, cute::Int<128>, cute::Int<128>, cute::Int<256>>(D, A, B,
             input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes, stream,
@@ -448,10 +455,9 @@ std::vector<tkc::CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getCon
     else if (mSm == 120 || mSm == 121)
     {
         std::vector<tkc::CutlassTileConfigSM120> tilesSm120 = {
-            // tkc::CutlassTileConfigSM120::CtaShape128x128x128B,
+            tkc::CutlassTileConfigSM120::CtaShape128x128x128B,
             tkc::CutlassTileConfigSM120::CtaShape128x128x256B,
             tkc::CutlassTileConfigSM120::CtaShape256x128x128B,
-
         };
         tkc::ClusterShape clusterShape = tkc::ClusterShape::ClusterShape_1x1x1;
         for (auto const& tile_config : tilesSm120)
@@ -527,4 +533,5 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::getWorkspaceSize(
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

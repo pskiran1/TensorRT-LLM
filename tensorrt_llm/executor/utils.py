@@ -34,10 +34,13 @@ def get_spawn_proxy_process_ipc_addr_env() -> str | None:
     return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR)
 
 
-def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes | None:
+def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes:
     ''' Get the HMAC key for the spawn proxy process dynamically. '''
-    if key := os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"):
-        return bytes.fromhex(key)
+    key = os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY")
+    assert key is not None, (
+        f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY} is not set. "
+        "HMAC encryption is required for IPC communication.")
+    return bytes.fromhex(key)
 
 
 def get_spawn_proxy_process_env() -> bool:
@@ -55,9 +58,9 @@ def create_mpi_comm_session(
         logger_debug(
             f"Using RemoteMpiPoolSessionClient to bind to external MPI processes at {get_spawn_proxy_process_ipc_addr_env()}\n",
             "yellow")
-        get_spawn_proxy_process_ipc_hmac_key_env()
+        hmac_key = get_spawn_proxy_process_ipc_hmac_key_env()
         return RemoteMpiCommSessionClient(
-            addr=get_spawn_proxy_process_ipc_addr_env())
+            addr=get_spawn_proxy_process_ipc_addr_env(), hmac_key=hmac_key)
     else:
         logger_debug(
             f"Using MpiCommSession to bind to external MPI processes\n",
@@ -142,8 +145,6 @@ class WorkerCommIpcAddrs(NamedTuple):
     request_queue_addr: tuple[str, Optional[bytes]]
     worker_init_status_queue_addr: tuple[str, Optional[bytes]]
     result_queue_addr: tuple[str, Optional[bytes]]
-    stats_queue_addr: tuple[str, Optional[bytes]]
-    kv_cache_events_queue_addr: tuple[str, Optional[bytes]]
 
 
 def is_llm_response(instance):

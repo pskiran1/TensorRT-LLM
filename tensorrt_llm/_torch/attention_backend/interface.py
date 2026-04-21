@@ -3,7 +3,7 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (TYPE_CHECKING, Dict, Generic, List, Optional, Protocol,
+from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Optional, Protocol,
                     Tuple, Type, TypeVar, Union)
 
 import torch
@@ -11,15 +11,28 @@ from typing_extensions import Self
 
 if TYPE_CHECKING:
     from ..speculative.utils import SpecDecodingTensor
+    from ..speculative.interface import SpecMetadata
+    from ..speculative.spec_tree_manager import SpecTreeManager
 
+from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
                                      RotaryScalingType)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..memory_buffer_utils import Buffers
 from ..metadata import KVCacheParams
-from ..pyexecutor.resource_manager import KVCacheManager
+from ..pyexecutor.mamba_cache_manager import MambaCacheManager
+from ..pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
 from ..utils import get_model_extra_attrs
+
+try:
+    # Transformers v5
+    from transformers.configuration_utils import ALLOWED_ATTENTION_LAYER_TYPES
+except ImportError:
+    # Transformers v4
+    from transformers.configuration_utils import \
+        ALLOWED_LAYER_TYPES as ALLOWED_ATTENTION_LAYER_TYPES
 
 
 @dataclass
@@ -52,7 +65,9 @@ class AttentionMetadata:
     # The max number of sequences in a single batch.
     max_num_sequences: Optional[int] = None
     # The KV cache manager.
-    kv_cache_manager: KVCacheManager
+    kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
+    # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
+    draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False
@@ -134,6 +149,9 @@ class AttentionMetadata:
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
 
+    mamba_metadata: Optional[Any] = None
+    mamba_chunk_size: int = 128
+
     # The number of tokens in the padded sequence.
     padded_num_tokens: Optional[int] = None
 
@@ -144,6 +162,8 @@ class AttentionMetadata:
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
+    # The number of heads per kv head.
+    num_heads_per_kv: Optional[int] = 1
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -154,6 +174,9 @@ class AttentionMetadata:
         assert self.cross is None or type(self) is type(
             self.cross
         ), "Top level and cross attention sub metadata type mismatched"
+
+    def on_update_kv_lens(self):
+        pass
 
     def on_update(self):
         if (self._seq_lens is not None
@@ -180,7 +203,7 @@ class AttentionMetadata:
 
         # The model executor sets seq_lens to None initially.
         if self._seq_lens is not None:
-            self._seq_lens = self._seq_lens.pin_memory()
+            self._seq_lens = maybe_pin_memory(self._seq_lens)
 
             if self.is_cuda_graph and self._seq_lens_cuda is not None:
                 # Very important: do not reallocate if we are using CUDA graphs.
@@ -230,7 +253,7 @@ class AttentionMetadata:
         self.on_update()
         # The model executor sets seqlens to None initially.
         if self._seq_lens_kv is not None:
-            self._seq_lens_kv = self._seq_lens_kv.pin_memory()
+            self._seq_lens_kv = maybe_pin_memory(self._seq_lens_kv)
             self._seq_lens_kv_cuda = self._seq_lens_kv.cuda(non_blocking=True)
 
     @property
@@ -275,6 +298,23 @@ class AttentionMetadata:
         """
         Hook to be called before the forward step of the model.
         """
+        self._prepare_mamba_metadata()
+
+    def _prepare_mamba_metadata(self):
+        if self.mamba_metadata is False:
+            return
+
+        if self.mamba_metadata is None:
+            if (self.kv_cache_manager is not None
+                    and isinstance(self.kv_cache_manager, MambaCacheManager)):
+                from ..modules.mamba.mamba2_metadata import Mamba2Metadata
+                self.mamba_metadata = Mamba2Metadata(self.max_num_requests,
+                                                     self.mamba_chunk_size)
+            else:
+                self.mamba_metadata = False
+                return
+
+        self.mamba_metadata.prepare(self)
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
@@ -335,19 +375,76 @@ class AttentionMetadata:
 
     def update_spec_dec_param(
             self,
+            batch_size,
             is_spec_decoding_enabled,
             is_spec_dec_tree,
             is_spec_dec_dynamic_tree,
-            max_draft_tokens,
+            max_draft_len,
+            max_total_draft_tokens,
+            model_is_wrapped: bool = False,
+            spec_metadata: Optional['SpecMetadata'] = None,
+            spec_tree_manager: Optional['SpecTreeManager'] = None,
             spec_decoding_tensor: Optional['SpecDecodingTensor'] = None):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
+        """
+
+    def update_helix_param(
+        self,
+        helix_position_offsets: List[int],
+        helix_is_inactive_rank: List[bool],
+    ) -> None:
+        """
+        Hook to be called when using helix parallelism.
         """
 
     def update_for_spec_dec(self) -> None:
         """
         Hook to be called during forward when using spec-dec one-model mode.
         """
+
+    @staticmethod
+    def get_empty(buffers: Buffers,
+                  tensor_shape: list[int],
+                  dtype: torch.dtype,
+                  cache_name: str,
+                  capture_graph: bool = False) -> torch.Tensor:
+        """
+        Finds a compatible, reusable buffer from a cache or creates a new one.
+
+        This function searches for a pre-allocated tensor (buffer) that can be
+        reused for an operation involving a tensor with the shape of `tensor_shape`.
+
+        The compatibility rules are: The buffer's total elements must be >= tensor_shape's.
+
+        If a compatible buffer is found, it's returned immediately. Otherwise, a new
+        buffer is allocated on the 'cuda' device with the give properties of 'tensor_shape' and 'dtype'.
+
+        Args:
+            tensor_shape: The required shape.
+            dtype: The required dtype.
+            cache_name: The key for the specific list of buffers to search in.
+        Returns:
+            An existing compatible buffer or a newly created one.
+        """
+        if buffers is None:
+            return torch.zeros(tensor_shape, device='cuda', dtype=dtype)
+
+        return buffers.get_buffer(tensor_shape, dtype, cache_name,
+                                  capture_graph)
+
+    @staticmethod
+    def get_empty_like(buffers,
+                       like_tensor: torch.Tensor,
+                       cache_name: str,
+                       capture_graph: bool = False) -> torch.Tensor:
+        return AttentionMetadata.get_empty(
+            buffers,
+            like_tensor.shape,
+            dtype=like_tensor.dtype,
+            cache_name=cache_name,
+            capture_graph=capture_graph,
+        )
 
 
 class PositionalEmbedder(Protocol):
@@ -380,11 +477,18 @@ class RopeParams:
     short_factor: Optional[Tuple[float]] = None
     long_factor: Optional[Tuple[float]] = None
     max_seq_len: Optional[int] = None
-    duplicate_data: bool = True
+    duplicate_data: bool = False
 
     @staticmethod
     def from_config(config) -> "RopeParams":
         rope_params = RopeParams()
+
+        hf_rope_parameters = getattr(config, 'rope_parameters', None)
+        if hf_rope_parameters is not None:
+            assert not set(hf_rope_parameters.keys()).issubset(
+                ALLOWED_ATTENTION_LAYER_TYPES), (
+                    "Per-layer-type RoPE configuration is not supported yet.")
+            config.update(hf_rope_parameters)
 
         # get rotary parameters.
         hidden_size = config.hidden_size
@@ -399,10 +503,13 @@ class RopeParams:
                            or getattr(config, 'partial_rotary_factor', None)
                            or 1.0)
         # rotary embedding dim.
+        qk_rope_head_dim = getattr(config, 'qk_rope_head_dim', None)
         rope_params.dim = (getattr(config, 'rotary_dim', None)
                            or getattr(config, 'rotary_emb_base', None)
-                           or getattr(config, 'qk_rope_head_dim', None)
+                           or qk_rope_head_dim
                            or int(head_dim * rope_percentage))
+        if qk_rope_head_dim is not None:
+            rope_params.duplicate_data = True
         # rotary scaling.
         rope_params.scale_type = RotaryScalingType.none
         rope_params.scale = 1.0
@@ -476,6 +583,7 @@ class RopeParams:
                 short_factor=self.short_factor,
                 long_factor=self.long_factor,
                 max_seq_len=self.max_seq_len,
+                duplicate_data=self.duplicate_data,
             )
         else:
             rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
@@ -491,7 +599,9 @@ class RopeParams:
                     "high_freq_factor": self.high_freq_factor,
                     "original_max_position_embeddings":
                     self.original_max_positions,
-                })
+                },
+                duplicate_data=self.duplicate_data,
+            )
         if rope_inv_freq is not None:
             rope_inv_freq = torch.tensor(
                 rope_inv_freq,
@@ -525,8 +635,9 @@ class PositionalEmbeddingParams:
     rope: Optional[RopeParams] = None
     is_neox: bool = True
 
-    # mRoPE params (currently, Qwen2/2.5-VL uses it)
+    # mRoPE params
     mrope_section: Optional[List[int]] = None
+    mrope_interleaved: bool = False
 
     def __post_init__(self) -> None:
         if self.type.is_deferred():
@@ -642,9 +753,13 @@ class AttentionBackend(Generic[TMetadata]):
     def support_mla(cls) -> bool:
         return False
 
-    @classmethod
-    def support_nvfp4_output(cls) -> bool:
-        return False
+    def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:
+        """
+        Create the output tensors for the attention operation.
+        """
+        num_tokens = q.shape[0]
+        hidden_size = self.num_heads * self.head_dim
+        return [q.new_empty([num_tokens, hidden_size], dtype=q.dtype)]
 
 
 @dataclass(kw_only=True, unsafe_hash=True)

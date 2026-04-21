@@ -61,12 +61,14 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Paths to custom module directories to import.",
 )
 @optgroup.option(
+    "--config",
     "--extra_llm_api_options",
+    "extra_llm_api_options",
     type=str,
     default=None,
     help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
-)
+    "Path to a YAML file that overwrites the parameters specified by trtllm-bench. "
+    "Can be specified as either --config or --extra_llm_api_options.")
 @optgroup.option("--sampler_options",
                  type=click.Path(exists=True,
                                  readable=True,
@@ -125,6 +127,14 @@ from tensorrt_llm.sampling_params import SamplingParams
     is_flag=True,
     default=False,
     help="Do not skip tokenizer initialization when loading the model.",
+)
+@optgroup.option(
+    "--custom_tokenizer",
+    type=str,
+    default=None,
+    help="Custom tokenizer alias (e.g., 'deepseek_v32', 'glm_moe_dsa') or "
+    "fully-qualified 'module.path.ClassName' for models whose HF tokenizer "
+    "is incompatible with AutoTokenizer.",
 )
 @optgroup.option(
     "--eos_id",
@@ -293,14 +303,16 @@ def throughput_command(
 ) -> None:
     """Run a throughput test on a TRT-LLM engine."""
     logger.info("Preparing to run throughput benchmark...")
+
     # Parameters from CLI
     image_data_format: str = params.get("image_data_format", "pt")
     data_device: str = params.get("data_device", "cpu")
     no_skip_tokenizer_init: bool = params.get("no_skip_tokenizer_init", False)
+    custom_tokenizer: str = params.get("custom_tokenizer", None)
 
     # Get general CLI options using the centralized function
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
-    tokenizer = initialize_tokenizer(options.checkpoint_path)
+    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
 
     # Extract throughput-specific options not handled by GeneralExecSettings
     max_batch_size = params.get("max_batch_size")
@@ -316,6 +328,12 @@ def throughput_command(
             logger.error(
                 f"Failed to import custom module from {custom_module_dir}: {e}")
             raise e
+
+    # Eagerly import auto_deploy to ensure custom model configs
+    # are registered with transformers.AutoConfig before
+    # options.model_type triggers AutoConfig.from_pretrained().
+    if options.backend == "_autodeploy":
+        import tensorrt_llm._torch.auto_deploy  # noqa: F401
 
     # Runtime kwargs and option tracking.
     kwargs = {}
@@ -350,7 +368,7 @@ def throughput_command(
         # If we're dealing with a model name, perform a snapshot download to
         # make sure we have a local copy of the model.
         if bench_env.checkpoint_path is None:
-            snapshot_download(options.model)
+            snapshot_download(options.model, revision=bench_env.revision)
 
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
@@ -376,6 +394,7 @@ def throughput_command(
             param_hint="backend")
 
     exec_settings["model"] = options.model
+    exec_settings["revision"] = bench_env.revision
     engine_bs = exec_settings["settings_config"]["max_batch_size"]
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
 
@@ -409,6 +428,8 @@ def throughput_command(
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
         kwargs['backend'] = options.backend
+        if bench_env.telemetry_config is not None:
+            kwargs["telemetry_config"] = bench_env.telemetry_config
 
         llm = get_llm(runtime_config, kwargs)
 
@@ -424,6 +445,12 @@ def throughput_command(
 
         post_proc_params = None  # No detokenization
 
+        has_multi_turn = any(r.is_multi_turn for r in requests)
+        multi_turn_tokenizer = tokenizer if has_multi_turn else None
+        if has_multi_turn:
+            logger.info("Multi-turn requests detected. Turns will be processed "
+                        "sequentially within each request.")
+
         # Perform warmup if requested.
         if options.warmup > 0:
             logger.info("Setting up for warmup...")
@@ -436,7 +463,8 @@ def throughput_command(
                                 warmup_dataset,
                                 False,
                                 options.concurrency,
-                                modality=options.modality))
+                                modality=options.modality,
+                                tokenizer=multi_turn_tokenizer))
             # WAR: IterationResult is a singleton tied to the executor.
             # Since the benchmark calls asyncio.run() multiple times (e.g., during warmup),
             # we must reset it to ensure it attaches to the correct event loop.
@@ -453,7 +481,8 @@ def throughput_command(
                                 options.streaming,
                                 options.concurrency,
                                 iteration_writer.full_address,
-                                modality=options.modality))
+                                modality=options.modality,
+                                tokenizer=multi_turn_tokenizer))
 
         logger.info("Benchmark done. Reporting results...")
         if options.modality is not None:

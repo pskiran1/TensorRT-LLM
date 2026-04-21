@@ -84,13 +84,13 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
         if model_type == 'llava_next':
             input_processor = LlavaNextInputProcessor(
                 model_path=encoder_model_dir,
-                model_config=model_config_dict,
+                config=model_config_dict,
                 tokenizer=tokenizer,
                 trust_remote_code=True)
         elif model_type == 'qwen2_5_vl':
             input_processor = Qwen2VLInputProcessorBase(
                 model_path=encoder_model_dir,
-                model_config=model_config_dict,
+                config=model_config_dict,
                 tokenizer=tokenizer,
                 trust_remote_code=True)
         else:
@@ -122,9 +122,13 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
             image_width, image_height = test_image.size
 
             # Get actual embedding tensor for this image
+            disagg_params = encoder_outputs[image_idx].disaggregated_params
+            assert disagg_params is not None
+            mm_embedding_handles = disagg_params.multimodal_embedding_handles
+            assert mm_embedding_handles is not None
+            assert len(mm_embedding_handles) == 1
             actual_embedding = SharedTensorContainer.from_dict(
-                encoder_outputs[image_idx].mm_embedding_handle).get_local_view(
-                )
+                mm_embedding_handles[0]).get_local_view()
 
             # The first dimension should be the number of image tokens
             actual_num_tokens = actual_embedding.shape[0]
@@ -191,13 +195,13 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
         if model_type == 'llava_next':
             input_processor = LlavaNextInputProcessor(
                 model_path=encoder_model_dir,
-                model_config=model_config_dict,
+                config=model_config_dict,
                 tokenizer=tokenizer,
                 trust_remote_code=True)
         elif model_type == 'qwen2_5_vl':
             input_processor = Qwen2VLInputProcessorBase(
                 model_path=encoder_model_dir,
-                model_config=model_config_dict,
+                config=model_config_dict,
                 tokenizer=tokenizer,
                 trust_remote_code=True)
         else:
@@ -230,9 +234,13 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
             video_width, video_height = video_data.frames[0].size
 
             # Get actual embedding tensor for this image
+            disagg_params = encoder_outputs[video_idx].disaggregated_params
+            assert disagg_params is not None
+            mm_embedding_handles = disagg_params.multimodal_embedding_handles
+            assert mm_embedding_handles is not None
+            assert len(mm_embedding_handles) == 1
             actual_embedding = SharedTensorContainer.from_dict(
-                encoder_outputs[video_idx].mm_embedding_handle).get_local_view(
-                )
+                mm_embedding_handles[0]).get_local_view()
 
             # The first dimension should be the number of image tokens
             actual_num_tokens = actual_embedding.shape[0]

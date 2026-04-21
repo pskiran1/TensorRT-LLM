@@ -19,6 +19,8 @@ from typing import Optional
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm.mapping import Mapping
+
 from ..attention_backend.interface import PositionalEmbeddingParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
@@ -158,6 +160,10 @@ class QKNormRoPEAttention(Attention):
         disable_deep_gemm: bool = False,
         use_gemma_rms_norm: bool = False,
         attn_output_gate: Optional[bool] = None,
+        is_qk_norm: bool = True,
+        reduce_output: bool = True,
+        rope_fusion: bool = True,
+        mapping_with_cp: Optional[Mapping] = None,
     ):
         self.pretrained_config = config.pretrained_config
 
@@ -168,7 +174,9 @@ class QKNormRoPEAttention(Attention):
 
         # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb
         # will be skipped in the overridden apply_rope.
-        rope_fusion = not self.fuse_qk_norm_rope and not skip_rope and not attn_output_gate and not use_gemma_rms_norm
+        rope_fusion &= (not self.fuse_qk_norm_rope and not skip_rope
+                        and not attn_output_gate and not use_gemma_rms_norm)
+        self.is_qk_norm = is_qk_norm
         assert not (fuse_qk_norm_rope and skip_rope
                     ), "Fusing qk norm and skipping rope is not supported"
 
@@ -187,17 +195,19 @@ class QKNormRoPEAttention(Attention):
             q_scaling=q_scaling,
             disable_deep_gemm=disable_deep_gemm,
             attn_output_gate=attn_output_gate,
+            reduce_output=reduce_output,
+            mapping_with_cp=mapping_with_cp,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=self.pretrained_config.rms_norm_eps,
                               dtype=self.pretrained_config.torch_dtype,
-                              has_weights=True,
+                              has_weights=is_qk_norm,
                               use_gemma=use_gemma_rms_norm)
         self.k_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=self.pretrained_config.rms_norm_eps,
                               dtype=self.pretrained_config.torch_dtype,
-                              has_weights=True,
+                              has_weights=is_qk_norm,
                               use_gemma=use_gemma_rms_norm)
         self.aux_stream = torch.cuda.Stream()
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
@@ -218,6 +228,7 @@ class QKNormRoPEAttention(Attention):
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
+            disable_on_compile=True,
         )
 
         return q, k
@@ -225,13 +236,19 @@ class QKNormRoPEAttention(Attention):
     def apply_qk_norm_rope(self, qkv, position_ids):
         factor, low, high, attention_factor = compute_yarn_parameters(
             self.pretrained_config)
+
+        partial_rotary_factor = self.pretrained_config.partial_rotary_factor if hasattr(
+            self.pretrained_config, "partial_rotary_factor") else 1.0
+        rotary_dim = int(self.head_dim * partial_rotary_factor)
+
         torch.ops.trtllm.fused_qk_norm_rope(
             qkv, self.num_heads, self.num_key_value_heads,
-            self.num_key_value_heads, self.head_dim,
+            self.num_key_value_heads, self.head_dim, rotary_dim,
             self.q_norm.variance_epsilon, self.q_norm.weight,
             self.k_norm.weight,
             self.pos_embd_params.rope.theta, self.pos_embd_params.is_neox,
-            position_ids.view(-1), factor, low, high, attention_factor)
+            position_ids.view(-1), factor, low, high, attention_factor,
+            self.is_qk_norm)
         return qkv, None, None
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],

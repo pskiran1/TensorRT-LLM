@@ -1,39 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Triton-kernels-based MXFP4 MoE ops (GPT-OSS style) with routing, swizzling, and fused activation
 
 from typing import Callable, Tuple
 
 import torch
 import torch.nn.functional as F
+from triton_kernels.matmul_ogs import (
+    FlexCtx,
+    FnSpecs,
+    FusedActivation,
+    GatherIndx,
+    PrecisionConfig,
+    RoutingData,
+    ScatterIndx,
+    matmul_ogs,
+)
+from triton_kernels.numerics import InFlexData
+from triton_kernels.swiglu import swiglu_fn
+from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
+from triton_kernels.tensor_details import layout
+from triton_kernels.tensor_details.layout import StridedLayout
 
-IS_TRITON_KERNELS_AVAILABLE = True
-TRITON_KERNELS_UNAVAILABLE_REASON = ""
-
-try:
-    from triton_kernels.matmul_ogs import (
-        FlexCtx,
-        FnSpecs,
-        FusedActivation,
-        PrecisionConfig,
-        matmul_ogs,
-    )
-    from triton_kernels.numerics import InFlexData
-    from triton_kernels.routing import RoutingData, routing
-    from triton_kernels.swiglu import swiglu_fn
-    from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
-    from triton_kernels.tensor_details import layout
-    from triton_kernels.tensor_details.layout import StridedLayout
-
-    from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import TritonEPRouter
-
-except Exception as _e:
-    IS_TRITON_KERNELS_AVAILABLE = False
-    TRITON_KERNELS_UNAVAILABLE_REASON = f"{type(_e).__name__}: {_e}"
-
-    FlexCtx = FnSpecs = FusedActivation = PrecisionConfig = matmul_ogs = None
-    InFlexData = RoutingData = routing = swiglu_fn = None
-    FP4 = convert_layout = wrap_torch_tensor = None
-    layout = StridedLayout = None
-    TritonEPRouter = None
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import TritonEPRouter
 
 
 # copied from transformers.integrations.mxfp4::swizzle_mxfp4 with minor modification
@@ -44,7 +46,7 @@ def _swizzle_mxfp4(w, w_scale):
     return w, w_scale
 
 
-RouteFn = Callable[[torch.Tensor], Tuple[RoutingData, torch.Tensor, torch.Tensor]]
+RouteFn = Callable[[torch.Tensor], Tuple[RoutingData, GatherIndx, ScatterIndx]]
 
 
 def _prepare_weights_scales(
@@ -122,7 +124,8 @@ def _run_mxfp4_mlp_core(
     )
 
     act = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (float(alpha), float(limit)), 2
+        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
+        (float(alpha), float(limit)),
     )
 
     # gate_up (with SWiGLU fused)
@@ -169,9 +172,12 @@ def triton_mxfp4_moe(
     down_blocks: torch.Tensor,  # [E, H, I//32, 16] in uint8
     down_bias: torch.Tensor,  # [E, H]
     down_scales: torch.Tensor,  # [E, H, I//32] in uint8
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     def _global_route_fn(logits: torch.Tensor):
-        return routing(logits, top_k)
+        # routing() removed in triton_kernels 3.6.0
+        # TritonEPRouter(ep=1) is equivalent
+        return TritonEPRouter()(logits, top_k)
 
     return _run_mxfp4_mlp_core(
         hidden_states,
@@ -203,6 +209,7 @@ def _mxfp4_mlp_fake(
     down_blocks: torch.Tensor,
     down_bias: torch.Tensor,
     down_scales: torch.Tensor,
+    layer_type: str = "moe",
 ):
     return torch.empty_like(hidden_states)
 
@@ -226,6 +233,7 @@ def triton_mxfp4_moe_ep(
     # EP topology
     ep_size: int,
     ep_rank: int,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     triton_ep_router = TritonEPRouter()
 
@@ -264,5 +272,6 @@ def _mxfp4_mlp_ep_fake(
     down_scales: torch.Tensor,
     ep_size: int,
     ep_rank: int,
+    layer_type: str = "moe",
 ):
     return torch.empty_like(hidden_states)

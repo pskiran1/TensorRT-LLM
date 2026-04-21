@@ -1,8 +1,9 @@
 import math
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
-from functools import wraps
-from typing import Optional
+from enum import IntEnum
+from functools import lru_cache, wraps
+from typing import Any, Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,10 +16,12 @@ try:
 except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
+from tensorrt_llm._mnnvl_utils import init_helix_cp_comm
 from tensorrt_llm._utils import (mpi_allgather, mpi_barrier, mpi_comm,
                                  mpi_disabled, mpi_isend, mpi_isend_object,
                                  mpi_recv, mpi_recv_object, mpi_send,
-                                 mpi_send_object, torch_pybind11_abi)
+                                 mpi_send_object, mpi_world_size,
+                                 torch_pybind11_abi)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
 from tensorrt_llm.logger import logger
@@ -30,10 +33,58 @@ except ModuleNotFoundError:
     from tensorrt_llm import ray_stub as ray
 
 
+class ReduceOp(IntEnum):
+    SUM = 0
+    PRODUCT = 1
+    MIN = 2
+    MAX = 3
+    BAND = 4
+    BOR = 5
+    BXOR = 6
+
+
+_reduce_op_to_torch_dict = {
+    ReduceOp.SUM: torch.distributed.ReduceOp.SUM,
+    ReduceOp.PRODUCT: torch.distributed.ReduceOp.PRODUCT,
+    ReduceOp.MIN: torch.distributed.ReduceOp.MIN,
+    ReduceOp.MAX: torch.distributed.ReduceOp.MAX,
+    ReduceOp.BAND: torch.distributed.ReduceOp.BAND,
+    ReduceOp.BOR: torch.distributed.ReduceOp.BOR,
+    ReduceOp.BXOR: torch.distributed.ReduceOp.BXOR,
+}
+
+
+def reduce_op_to_torch(op: ReduceOp) -> torch.distributed.ReduceOp:
+    return _reduce_op_to_torch_dict[op]
+
+
+_reduce_op_to_mpi_dict = {
+    ReduceOp.SUM: MPI.SUM,
+    ReduceOp.PRODUCT: MPI.PROD,
+    ReduceOp.MIN: MPI.MIN,
+    ReduceOp.MAX: MPI.MAX,
+    ReduceOp.BAND: MPI.BAND,
+    ReduceOp.BOR: MPI.BOR,
+    ReduceOp.BXOR: MPI.BXOR,
+}
+
+
+def reduce_op_to_mpi(op: ReduceOp) -> MPI.Op:
+    return _reduce_op_to_mpi_dict[op]
+
+
 class Distributed(ABC):
 
     def __init__(self, mapping: Mapping):
         self.mapping = mapping
+
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def get(mapping: Mapping) -> "Distributed":
+        if mpi_disabled():
+            return TorchDist(mapping)
+        else:
+            return MPIDist(mapping)
 
     @property
     def rank(self):
@@ -108,12 +159,73 @@ class Distributed(ABC):
         return self.mapping.cp_config
 
     @abstractmethod
+    def barrier(self):
+        pass
+
+    @abstractmethod
+    def tp_barrier(self):
+        pass
+
+    @abstractmethod
     def broadcast(self, obj, root=0):
         pass
 
     @abstractmethod
     def allgather(self, obj, root=0):
         pass
+
+    @abstractmethod
+    def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
+        pass
+
+    @abstractmethod
+    def tp_broadcast(self, obj, root=0, **kwargs):
+        pass
+
+    @abstractmethod
+    def cp_broadcast(self, obj, root=0, **kwargs):
+        pass
+
+    def tp_cp_broadcast(self, obj, root=0, **kwargs):
+        """Broadcast object across both TP and CP groups.
+
+        This is used when both TP and CP parallelism are enabled (e.g., helix parallelism).
+        First broadcasts within the TP group, then within the CP group.
+        """
+        if self.tp_size > 1:
+            obj = self.tp_broadcast(obj, root=root, **kwargs)
+        if self.cp_size > 1:
+            obj = self.cp_broadcast(obj, root=root, **kwargs)
+        return obj
+
+    @abstractmethod
+    def tp_allgather(self, obj):
+        pass
+
+    @abstractmethod
+    def cp_allgather(self, obj):
+        pass
+
+    def tp_cp_allgather(self, obj):
+        """Allgather across both TP and CP dimensions.
+
+        First gathers within CP group, then across TP groups, returning
+        a flattened list with tp_size * cp_size entries.
+        """
+        # Gather across CP dimension.
+        if self.cp_size > 1:
+            obj = self.cp_allgather(obj)
+        else:
+            obj = [obj]  # Wrap to match cp_allgather output format.
+
+        # Gather across TP dimension.
+        if self.tp_size > 1:
+            obj = self.tp_allgather(obj)
+        else:
+            obj = [obj]  # Wrap to match tp_allgather output format.
+
+        # Flatten: [[cp0, cp1], [cp0, cp1], ...] -> [tp0_cp0, tp0_cp1, tp1_cp0, ...]
+        return [entry for tp_group in obj for entry in tp_group]
 
 
 def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
@@ -218,122 +330,283 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
             raise RuntimeError(f"Deserialization failed: {str(e)}") from e
 
 
-def safe_gather(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
-    """
-    Safely gather potentially large objects by splitting into fixed-size chunks,
-    using raw-byte MPI.Gatherv. This variant uses Allgather on lengths so every
-    rank can compute sizes/displacements/total locally, removing extra broadcasts.
+def _prepare_chunked_transfer(
+    comm: Any,
+    obj: Any,
+    chunk_size: int,
+) -> Tuple[int, int, np.ndarray, np.ndarray, np.ndarray, int, int]:
+    """Common preparation for safe_gather and safe_allgather.
+
+    Validates chunk_size, serializes the object, exchanges payload lengths
+    across all ranks, and computes displacements and round counts for a
+    chunked MPI transfer.
 
     Args:
-        comm: communicator to gather
-        obj: Python object to gather
-        root: Rank that receives the gathered objects
-        chunk_size: Per-round max bytes each rank contributes (default: 4MB)
+        comm: MPI communicator (``MPI.Comm`` instance).
+        obj: Python object to transfer (must be picklable).
+        chunk_size: Per-round max bytes each rank contributes.
 
     Returns:
-        On root: list of deserialized objects (len == comm.size)
-        On non-root: None
+        Tuple of ``(rank, size, lengths, displs, sendbuf, num_rounds,
+        chunk_size)`` where:
+
+        - **rank** (*int*) — this process's rank in *comm*.
+        - **size** (*int*) — total number of ranks in *comm*.
+        - **lengths** (*np.ndarray[int64]*) — per-rank serialized payload
+          sizes.
+        - **displs** (*np.ndarray[int64]*) — per-rank byte offsets into a
+          concatenated receive buffer.
+        - **sendbuf** (*np.ndarray[uint8]*) — this rank's serialized
+          payload as a contiguous byte array.
+        - **num_rounds** (*int*) — number of chunked transfer rounds
+          needed.
+        - **chunk_size** (*int*) — possibly reduced from the input to keep
+          per-round displacements within int32.
     """
-    if not ENABLE_MULTI_DEVICE:
-        return [obj]
-    if ENABLE_MULTI_DEVICE and MPI is None:
-        raise RuntimeError(
-            "mpi4py is required when ENABLE_MULTI_DEVICE is True")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
 
     rank = comm.Get_rank()
     size = comm.Get_size()
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be > 0")
 
-    # -- Serialize locally --
+    # Ensure chunk_size * size fits in int32 for per-round displacements.
+    max_safe_chunk = np.iinfo(np.int32).max // size if size > 0 else chunk_size
+    if chunk_size > max_safe_chunk:
+        logger.info(
+            "_prepare_chunked_transfer: reducing chunk_size from %d to %d "
+            "to keep per-round displacements within int32 (size=%d)",
+            chunk_size, max_safe_chunk, size)
+        chunk_size = max_safe_chunk
+
     try:
         payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-        my_n = np.int64(len(payload))
     except Exception as e:
-        # Keep collectives aligned: every rank must call Allgather exactly once
-        _ = comm.allgather(int(-1))
+        _ = comm.allgather(-1)
         raise RuntimeError(f"Rank {rank} serialization failed: {e}") from e
 
-    # -- Allgather lengths so all ranks know sizes and can compute displacements --
-    # We allgather just the int64 length to minimize traffic.
-    lengths = np.array(comm.allgather(int(my_n)),
-                       dtype=np.int64)  # shape (size,)
+    lengths = np.array(comm.allgather(len(payload)), dtype=np.int64)
     if (lengths < 0).any():
-        raise RuntimeError(f"Serialization failed on at least one rank")
-    # Every rank computes displacements & total locally and identically:
+        raise RuntimeError("Serialization failed on at least one rank")
+
     displs = np.zeros(size, dtype=np.int64)
     if size > 1:
         displs[1:] = np.cumsum(lengths[:-1])
-    total = int(lengths.sum())
 
-    # -- Prepare buffers --
-    sendbuf_full = np.frombuffer(payload, dtype=np.uint8, count=len(payload))
-    if rank == root:
-        recvbuf = np.empty(total,
-                           dtype=np.uint8)  # single contiguous receive buffer
-    else:
-        recvbuf = None
-
-    # -- Chunked Gatherv loop --
-    # IMPORTANT: All ranks must execute the same number of Gatherv rounds.
-    # Using a deterministic schedule based only on (lengths, chunk_size):
-    #   num_rounds = ceil(max(lengths)/chunk_size)
+    sendbuf = np.frombuffer(payload, dtype=np.uint8)
     max_len = int(lengths.max()) if size > 0 else 0
-    num_rounds = (max_len + chunk_size - 1) // chunk_size if max_len > 0 else 0
+    num_rounds = math.ceil(max_len / chunk_size) if max_len > 0 else 0
 
+    return rank, size, lengths, displs, sendbuf, num_rounds, chunk_size
+
+
+def _chunked_transfer_loop(
+    comm: Any,
+    rank: int,
+    size: int,
+    lengths: np.ndarray,
+    displs: np.ndarray,
+    sendbuf: np.ndarray,
+    num_rounds: int,
+    chunk_size: int,
+    recvbuf: Optional[np.ndarray],
+    collective_fn: Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+                            None],
+) -> None:
+    """Run the chunked MPI transfer loop used by safe_gather/safe_allgather.
+
+    Each round transfers at most ``chunk_size`` bytes per rank using a
+    per-round temporary receive buffer with 0-based int32 displacements,
+    then copies the received data into ``recvbuf`` at the correct absolute
+    offsets using 64-bit Python-level indexing.
+
+    Args:
+        comm: MPI communicator (``MPI.Comm`` instance).
+        rank: This rank's index in *comm*.
+        size: Total number of ranks in *comm*.
+        lengths: Per-rank serialized payload sizes (int64 array of shape
+            ``(size,)``).
+        displs: Per-rank byte offsets into *recvbuf* (int64 array of shape
+            ``(size,)``).
+        sendbuf: This rank's serialized payload (uint8 array).
+        num_rounds: Number of chunked transfer rounds to execute.
+        chunk_size: Per-round max bytes each rank contributes.
+        recvbuf: Final contiguous receive buffer (uint8 array), or
+            ``None`` for non-root ranks in gather mode (copy-back is
+            skipped).
+        collective_fn: Callable that performs the per-round MPI
+            collective.  Signature: ``collective_fn(send_part,
+            round_recvbuf, counts_this_round, round_displs)``.
+    """
     for r in range(num_rounds):
-        # Each rank contributes up to chunk_size bytes from its remaining payload
-        # this round. Round-local offset is r * chunk_size.
         round_offs = r * chunk_size
-        # Per-rank count this round:
-        #   count = max(0, min(chunk, length - round_offs))
-        remaining = lengths - round_offs
-        remaining = np.maximum(remaining, 0)
-        counts64 = np.minimum(remaining, chunk_size).astype(np.int64)
+        counts_this_round = np.minimum(np.maximum(lengths - round_offs, 0),
+                                       chunk_size).astype(np.int32)
+        sent_so_far = np.minimum(lengths, round_offs)
 
-        # Target displacements this round are base displs + round_offs (where count>0)
-        round_displs64 = displs + np.minimum(np.maximum(lengths, 0), round_offs)
+        round_recvbuf = (np.empty(counts_this_round.sum(), dtype=np.uint8)
+                         if recvbuf is not None else None)
+        round_displs = np.zeros(size, dtype=np.int32)
+        if size > 1:
+            round_displs[1:] = np.cumsum(counts_this_round[:-1])
 
-        # Many MPI impls expect 32-bit ints for counts/displs in Gatherv
-        counts32 = counts64.astype(np.int32)
-        displs32 = round_displs64.astype(np.int32)
+        send_part = sendbuf[sent_so_far[rank]:sent_so_far[rank] +
+                            counts_this_round[rank]]
 
-        # Local slice to send this round (may be zero-length)
-        send_start = min(round_offs, int(my_n))
-        send_len = int(counts32[rank])
-        send_part = sendbuf_full[send_start:send_start + send_len]
+        collective_fn(send_part, round_recvbuf, counts_this_round, round_displs)
 
+        # Copy received chunks into the final buffer at correct
+        # absolute offsets (using 64-bit Python-level indexing).
+        if recvbuf is not None:
+            src_offset = 0
+            for i in range(size):
+                n = counts_this_round[i]
+                if n > 0:
+                    dst = displs[i] + sent_so_far[i]
+                    recvbuf[dst:dst +
+                            n] = (round_recvbuf[src_offset:src_offset + n])
+                src_offset += n
+
+
+def _deserialize_recvbuf(
+    recvbuf: np.ndarray,
+    lengths: np.ndarray,
+    displs: np.ndarray,
+    size: int,
+) -> List[Any]:
+    """Deserialize gathered payloads from a contiguous receive buffer.
+
+    Args:
+        recvbuf: Contiguous receive buffer (uint8 array) containing the
+            concatenated serialized payloads from all ranks.
+        lengths: Per-rank serialized payload sizes (int64 array of shape
+            ``(size,)``).
+        displs: Per-rank byte offsets into *recvbuf* (int64 array of shape
+            ``(size,)``).
+        size: Total number of ranks.
+
+    Returns:
+        List of deserialized Python objects (``len == size``). Ranks whose
+        payload length is zero are represented as ``None``.
+    """
+    return [
+        pickle.loads(recvbuf[displs[i]:displs[i] + lengths[i]])  # nosec B301
+        if lengths[i] > 0 else None for i in range(size)
+    ]
+
+
+def safe_gather(
+    comm: Any,
+    obj: Any,
+    root: int = 0,
+    chunk_size: int = 4 * 1024 * 1024,
+) -> Optional[List[Any]]:
+    """Safely gather potentially large objects by splitting into fixed-size
+    chunks, using raw-byte MPI.Gatherv with a per-round temp buffer to
+    keep counts and displacements within int32.
+
+    Args:
+        comm: MPI communicator (``MPI.Comm`` instance) to gather over.
+        obj: Python object to gather (must be picklable).
+        root: Rank that receives the gathered objects.
+        chunk_size: Per-round max bytes each rank contributes (default:
+            4 MB).
+
+    Returns:
+        On *root*: list of deserialized objects (``len == comm.size``).
+        On non-root ranks: ``None``.
+    """
+    if not ENABLE_MULTI_DEVICE:
+        return [obj]
+    if MPI is None:
+        raise RuntimeError(
+            "mpi4py is required when ENABLE_MULTI_DEVICE is True")
+
+    rank, size, lengths, displs, sendbuf, num_rounds, chunk_size = \
+        _prepare_chunked_transfer(comm, obj, chunk_size)
+
+    # Fast path: when all payloads fit in a single round, the simple
+    # comm.gather avoids the chunked-loop overhead.
+    if num_rounds <= 1:
+        return comm.gather(obj, root=root)
+
+    recvbuf = np.empty(lengths.sum(), dtype=np.uint8) if rank == root else None
+
+    def _gatherv(send_part, round_recvbuf, counts, round_displs):
         if rank == root:
             comm.Gatherv([send_part, MPI.BYTE],
-                         [recvbuf, counts32, displs32, MPI.BYTE],
+                         [round_recvbuf, counts, round_displs, MPI.BYTE],
                          root=root)
         else:
             comm.Gatherv([send_part, MPI.BYTE], None, root=root)
 
-    # Note: ranks with zero data (my_n == 0) still participate in every Gatherv
-    # round with count=0. This is required to keep the collectives matched.
+    _chunked_transfer_loop(comm, rank, size, lengths, displs, sendbuf,
+                           num_rounds, chunk_size, recvbuf, _gatherv)
 
-    # -- Reconstruct on root --
     if rank == root:
-        out = []
-        for i in range(size):
-            sz = int(lengths[i])
-            if sz == 0:
-                # Deserialize a canonical empty/None. Adjust to your needs.
-                out.append(None)  # None
-                continue
-            start = int(displs[i])
-            blob = recvbuf[start:start + sz].tobytes()
-            try:
-                out.append(pickle.loads(blob))  # nosec B301
-            except Exception as e:
-                raise RuntimeError(
-                    f"Deserialization failed for rank {i}: {e}") from e
-        return out
-
+        return _deserialize_recvbuf(recvbuf, lengths, displs, size)
     return None
+
+
+def safe_allgather(
+    comm: Any,
+    obj: Any,
+    chunk_size: int = 4 * 1024 * 1024,
+) -> List[Any]:
+    """Safely allgather potentially large objects by splitting into
+    fixed-size chunks, using raw-byte MPI.Allgatherv. Every rank ends
+    up with the complete list of deserialized objects.
+
+    Why "safe": mpi4py's ``comm.allgather(obj)`` internally calls
+    ``MPI_Allgatherv`` with 32-bit ``int`` counts and displacements.
+    When any rank's serialized payload or the cumulative displacement
+    exceeds ~2 GB, this causes silent data corruption or segfaults.
+    Additionally, mpi4py's pickle5-based protocol may allocate extra
+    out-of-band buffers for large objects, causing unexpected memory
+    spikes. This function avoids both issues by:
+
+    1. Serializing once with ``pickle.dumps`` (no out-of-band buffers).
+    2. Transferring raw bytes in rounds of at most ``chunk_size`` per
+       rank, keeping each ``MPI_Allgatherv`` call's counts and
+       displacements within 32-bit limits.
+
+    For small objects the overhead is negligible (one extra allgather of
+    int64 lengths, single-round transfer), so this can be used as a
+    drop-in replacement for ``comm.allgather``.
+
+    Args:
+        comm: MPI communicator (``MPI.Comm`` instance) to allgather over.
+        obj: Python object to allgather (must be picklable).
+        chunk_size: Per-round max bytes each rank contributes (default:
+            4 MB).
+
+    Returns:
+        List of deserialized objects from all ranks
+        (``len == comm.size``).
+    """
+    if not ENABLE_MULTI_DEVICE:
+        return [obj]
+    if MPI is None:
+        raise RuntimeError(
+            "mpi4py is required when ENABLE_MULTI_DEVICE is True")
+
+    rank, size, lengths, displs, sendbuf, num_rounds, chunk_size = \
+        _prepare_chunked_transfer(comm, obj, chunk_size)
+
+    # Fast path: when all payloads fit in a single round, the simple
+    # comm.allgather avoids the chunked-loop overhead.
+    if num_rounds <= 1:
+        return comm.allgather(obj)
+
+    recvbuf = np.empty(lengths.sum(), dtype=np.uint8)
+
+    def _allgatherv(send_part, round_recvbuf, counts, round_displs):
+        comm.Allgatherv([send_part, MPI.BYTE],
+                        [round_recvbuf, counts, round_displs, MPI.BYTE])
+
+    _chunked_transfer_loop(comm, rank, size, lengths, displs, sendbuf,
+                           num_rounds, chunk_size, recvbuf, _allgatherv)
+
+    return _deserialize_recvbuf(recvbuf, lengths, displs, size)
 
 
 class MPIDist(Distributed):
@@ -341,9 +614,22 @@ class MPIDist(Distributed):
 
     def __init__(self, mapping: Mapping):
         super().__init__(mapping)
-        self.create_tp_comm()
-        self.create_pp_comm()
-        self.create_cp_comm()
+        self._cp_comm = None
+        self._tp_comm = None
+        self._pp_comm = None
+
+    def _validate_world_size(self):
+        """Validate world size before creating sub-communicators to prevent segfaults."""
+
+        if ENABLE_MULTI_DEVICE:
+            actual_world_size = mpi_world_size()
+            max_rank_needed = self.mapping.world_size
+
+            if max_rank_needed > actual_world_size:
+                raise RuntimeError(
+                    f"Mapping requires world_size={max_rank_needed} "
+                    f"(tp_size={self.mapping.tp_size} * pp_size={self.mapping.pp_size} * cp_size={self.mapping.cp_size}), "
+                    f"but MPI world size is only {actual_world_size}. ")
 
     def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = mpi_comm()
@@ -354,6 +640,9 @@ class MPIDist(Distributed):
 
     def barrier(self):
         mpi_barrier()
+
+    def tp_barrier(self):
+        self.tp_comm.Barrier()
 
     def isend(self, buf: np.ndarray, dest, tag=0):
         # non-blocking send numpy buffer
@@ -376,40 +665,74 @@ class MPIDist(Distributed):
     def recv_object(self, src, tag=0):
         return mpi_recv_object(src, tag)
 
-    def create_tp_comm(self):
-        new_group = mpi_comm().group.Incl(self.mapping.tp_group)
-        self.tp_comm = mpi_comm().Create_group(new_group)
+    @property
+    def tp_comm(self):
+        if self._tp_comm is None:
+            self._validate_world_size()
+            mapping = self.mapping
+            new_group = mpi_comm().group.Incl(mapping.tp_group)
+            self._tp_comm = mpi_comm().Create_group(new_group)
+        return self._tp_comm
 
-    def create_pp_comm(self):
-        new_group = mpi_comm().group.Incl(self.mapping.pp_group)
-        self.pp_comm = mpi_comm().Create_group(new_group)
+    @property
+    def pp_comm(self):
+        if self._pp_comm is None:
+            self._validate_world_size()
+            mapping = self.mapping
+            new_group = mpi_comm().group.Incl(mapping.pp_group)
+            self._pp_comm = mpi_comm().Create_group(new_group)
+        return self._pp_comm
 
-    def create_cp_comm(self):
-        new_group = mpi_comm().group.Incl(self.mapping.cp_group)
-        self.cp_comm = mpi_comm().Create_group(new_group)
+    @property
+    def cp_comm(self):
+        if self._cp_comm is None:
+            self._validate_world_size()
+            new_group = mpi_comm().group.Incl(self.mapping.cp_group)
+            self._cp_comm = mpi_comm().Create_group(new_group)
+        return self._cp_comm
 
-    def cp_allgather(self, obj):
-        return self.cp_comm.allgather(obj)
+    def cp_allgather(self, obj, chunk_size: int = 4 * 1024 * 1024):
+        comm = self.cp_comm
+        return safe_allgather(comm, obj, chunk_size=chunk_size)
 
-    def tp_allgather(self, obj):
-        return self.tp_comm.allgather(obj)
+    def cp_broadcast(self,
+                     obj,
+                     root=0,
+                     chunk_size: int = 4 * 1024 * 1024,
+                     **kwargs):
+        comm = self.cp_comm
+        return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
+
+    def tp_allgather(self, obj, chunk_size: int = 4 * 1024 * 1024):
+        comm = self.tp_comm
+        return safe_allgather(comm, obj, chunk_size=chunk_size)
 
     def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         comm = self.tp_comm
         return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
 
-    def tp_broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+    def tp_broadcast(self,
+                     obj,
+                     root=0,
+                     chunk_size: int = 4 * 1024 * 1024,
+                     **kwargs):
         comm = self.tp_comm
         return safe_broadcast(comm, obj, root=root, chunk_size=chunk_size)
 
-    def pp_allgather(self, obj):
-        return self.pp_comm.allgather(obj)
+    def pp_allgather(self, obj, chunk_size: int = 4 * 1024 * 1024):
+        comm = self.pp_comm
+        return safe_allgather(comm, obj, chunk_size=chunk_size)
 
-    def pp_gather(self, obj):
-        return self.pp_comm.gather(obj)
+    def pp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+        comm = self.pp_comm
+        return safe_gather(comm, obj, root=root, chunk_size=chunk_size)
 
     def pp_broadcast(self, obj, root=0):
         return self.pp_comm.bcast(obj, root)
+
+    def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
+        reduce_op = reduce_op_to_mpi(op)
+        return mpi_comm().allreduce(obj, reduce_op)
 
 
 class MultiHandleWrapper:
@@ -562,6 +885,10 @@ class TorchDist(Distributed):
         dist.barrier()
 
     @log_op
+    def tp_barrier(self):
+        dist.barrier(group=self.mapping.tp_group_pg)
+
+    @log_op
     def isend(self, buf: np.ndarray, dest, tag=0):
         # non-blocking send numpy buffer
         tensor = torch.from_numpy(buf)
@@ -606,8 +933,7 @@ class TorchDist(Distributed):
 
     @log_op
     def send_object(self, obj, dest, tag=0):
-        raise NotImplementedError(
-            "send_object is not implemented for TorchDist")
+        self.isend_object(obj, dest, tag).wait()
 
     @log_op
     def isend_object(self, obj, dest, tag=0):
@@ -625,24 +951,16 @@ class TorchDist(Distributed):
         return MultiHandleWrapper(works)
 
     @log_op
-    def recv_object_from_isend(self, src, tag):
-        size_tensor = torch.tensor([0], dtype=torch.int32)
-        torch.distributed.recv(size_tensor, src=src, tag=tag)
-        bytes_size = size_tensor.item()
-        recv_tensor = torch.empty(bytes_size, dtype=torch.uint8)
-        torch.distributed.recv(recv_tensor, src=src, tag=tag)
-        return _tensor_to_object(recv_tensor, bytes_size,
-                                 torch.distributed.group.WORLD)
-
-    @log_op
-    def allreduce(self,
-                  obj: int | float | torch.Tensor,
-                  op=torch.distributed.ReduceOp.SUM):
+    def allreduce(
+        self,
+        obj: int | float | torch.Tensor,
+        op: ReduceOp = ReduceOp.SUM,
+    ):
         is_base_type = isinstance(obj, int) or isinstance(obj, float)
         if is_base_type:
             obj = torch.tensor(obj)
 
-        dist.all_reduce(obj, op=op)
+        dist.all_reduce(obj, op=reduce_op_to_torch(op))
 
         if is_base_type:
             obj = obj.item()
@@ -694,7 +1012,7 @@ class TorchDist(Distributed):
             return output_list
 
     @log_op
-    def tp_broadcast(self, obj, root=0):
+    def tp_broadcast(self, obj, root=0, **kwargs):
         if isinstance(obj, torch.Tensor):
             dist.broadcast(obj, src=root, group=self.mapping.tp_group_pg)
             return obj
@@ -706,6 +1024,36 @@ class TorchDist(Distributed):
                 group=self.mapping.tp_group_pg,
                 device=torch.device("cpu"))
             return ret[0]
+
+    @log_op
+    def cp_broadcast(self, obj, root=0, **kwargs):
+        if isinstance(obj, torch.Tensor):
+            dist.broadcast(obj, src=root, group=self.mapping.cp_group_pg)
+            return obj
+        else:
+            ret = [obj]
+            torch.distributed.broadcast_object_list(
+                ret,
+                src=root,
+                group=self.mapping.cp_group_pg,
+                device=torch.device("cpu"))
+            return ret[0]
+
+    @log_op
+    def cp_allgather(self, obj):
+        if isinstance(obj, torch.Tensor):
+            output_list = [
+                torch.empty_like(obj)
+                for _ in range(self.mapping.cp_group_pg.size())
+            ]
+            dist.all_gather(output_list, obj, group=self.mapping.cp_group_pg)
+            return output_list
+        else:
+            output_list = [None] * self.mapping.cp_group_pg.size()
+            dist.all_gather_object(output_list,
+                                   obj,
+                                   group=self.mapping.cp_group_pg)
+            return output_list
 
     @log_op
     def pp_allgather(self, obj):
@@ -766,8 +1114,7 @@ class TorchDist(Distributed):
             return ret[0]
 
 
-# TODO: rename to PPCommNCCL
-class PPComm:
+class PPCommNCCL:
 
     def __init__(self, global_mapping: Mapping):
         self.mapping = global_mapping
@@ -775,11 +1122,27 @@ class PPComm:
             self.mapping.world_size,
             self.mapping.rank,
         )
+        self.tensor_ready_event = torch.cuda.Event()
+        self.send_stream = torch.cuda.Stream()
 
     def send(self, tensor: torch.Tensor, dest: Optional[int] = None):
         if dest is None:
             dest = self.mapping.next_pp_rank()
-        self.nccl_comm.send(tensor, dest)
+
+        # NCCL send kernel in send_stream cannot be captured,
+        # so we send in the current stream instead in CUDA graph cases.
+        if torch.cuda.is_current_stream_capturing():
+            self.nccl_comm.send(tensor, dest)
+            return
+
+        # If the tensor is allocated from non-default memory pool
+        # like userbuffers, its underlying memory may be reused
+        # before the send operation is completed.
+        # We clone the tensor to avoid write-write conflicts.
+        tensor = tensor.clone()
+        self.send_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.send_stream):
+            self.nccl_comm.send(tensor, dest)
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
@@ -802,13 +1165,18 @@ class PPCommTorch:
         if dest is None:
             dest = self.mapping.next_pp_rank()
 
-        self.pg.send([tensor], self._global_to_local_rank(dest), tag=0).wait()
+        work = self.pg.send([tensor], self._global_to_local_rank(dest), tag=0)
+        # Send operation cannot be captured without blocking wait,
+        # so we block the current stream in CUDA graph cases.
+        if torch.cuda.is_current_stream_capturing():
+            work.block_current_stream()
 
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
             src = self.mapping.prev_pp_rank()
 
-        self.pg.recv([tensor], self._global_to_local_rank(src), tag=0).wait()
+        work = self.pg.recv([tensor], self._global_to_local_rank(src), tag=0)
+        work.block_current_stream()
 
 
 _pp_comm = None
@@ -820,7 +1188,8 @@ def init_pp_comm(mapping):
     if mpi_disabled():
         _pp_comm = PPCommTorch(mapping)
     else:
-        _pp_comm = PPComm(mapping)
+        _pp_comm = PPCommNCCL(mapping)
+    init_helix_cp_comm(mapping)
 
 
 @TorchDist.log_op
@@ -833,3 +1202,19 @@ def pp_recv(tensor):
 def pp_send(tensor):
     """Send tensors to next pp rank."""
     _pp_comm.send(tensor)
+
+
+@torch.library.custom_op("trtllm::pp_recv_tensors", mutates_args=("tensors", ))
+def pp_recv_tensors(tensors: List[torch.Tensor]) -> None:
+    """
+    Receive tensors from previous pp rank.
+    """
+    for tensor in tensors:
+        pp_recv(tensor)
+
+
+@torch.library.custom_op("trtllm::pp_send_tensors", mutates_args=("tensors", ))
+def pp_send_tensors(tensors: List[torch.Tensor]) -> None:
+    """Send tensors to next pp rank."""
+    for tensor in tensors:
+        pp_send(tensor)

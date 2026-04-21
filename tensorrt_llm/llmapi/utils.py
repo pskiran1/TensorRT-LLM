@@ -1,9 +1,11 @@
 import asyncio
 import collections
+import ctypes
 import datetime
 import hashlib
 import inspect
 import io
+import math
 import os
 import re
 import sys
@@ -13,7 +15,7 @@ import time
 import traceback
 import warnings
 import weakref
-from functools import cache, wraps
+from functools import wraps
 from pathlib import Path
 from queue import Queue
 from typing import (Any, Callable, Iterable, List, Optional, Tuple, Type,
@@ -28,6 +30,18 @@ from pydantic import BaseModel
 from tqdm.auto import tqdm
 
 from tensorrt_llm.logger import Singleton, logger
+
+
+class StrictBaseModel(BaseModel):
+    """
+    A base model that forbids arbitrary fields.
+
+    All user-facing configuration classes should inherit from this to ensure
+    typos and invalid fields are caught at validation time.
+    """
+
+    class Config:
+        extra = "forbid"
 
 
 def print_traceback_on_error(func):
@@ -54,6 +68,7 @@ def print_colored(message,
         bold_red="\x1b[31;1m",
         bold_green="\033[1;32m",
         green="\033[0;32m",
+        cyan="\033[0;36m",
     )
     reset = "\x1b[0m"
 
@@ -111,6 +126,7 @@ def logger_debug(message,
             location) > 50 else location
         print_colored(f"{timestamp} [{cur_dualname}]", "bold_green", writer)
         print_colored(f" {message}\n", color, writer)
+        writer.flush()
     else:
         # Fallback to logger.debug
         logger.debug(message)
@@ -220,6 +236,7 @@ class DisabledTqdm(tqdm):
 
 def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
     ignore_patterns = ["original/**/*"]
+    logger.info(f"Downloading model {model} from HuggingFace")
     with get_file_lock(model):
         hf_folder = snapshot_download(
             model,
@@ -227,19 +244,36 @@ def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
             ignore_patterns=ignore_patterns,
             revision=revision,
             tqdm_class=DisabledTqdm)
+    logger.info(f"Finished downloading model {model} from HuggingFace")
     return Path(hf_folder)
 
 
-def download_hf_pretrained_config(model: str,
-                                  revision: Optional[str] = None) -> Path:
+def download_hf_partial(model: str,
+                        allow_patterns: List[str],
+                        revision: Optional[str] = None) -> Path:
+    """Download a partial model from HuggingFace.
+
+    Args:
+        model: The model name or path.
+        revision: The revision to use for the model.
+        allow_patterns: The patterns to allow for the model.
+
+    Returns:
+        The path to the downloaded model.
+    """
     with get_file_lock(model):
         hf_folder = snapshot_download(
             model,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             revision=revision,
-            allow_patterns=["config.json"],
+            allow_patterns=allow_patterns,
             tqdm_class=DisabledTqdm)
     return Path(hf_folder)
+
+
+def download_hf_pretrained_config(model: str,
+                                  revision: Optional[str] = None) -> Path:
+    return download_hf_partial(model, ["config.json"], revision)
 
 
 def append_docstring(docstring: str):
@@ -349,7 +383,6 @@ def enable_llmapi_debug() -> bool:
     return _enable_llmapi_debug_
 
 
-@cache
 def enable_worker_single_process_for_tp1() -> bool:
     ''' Tell whether to make worker use single process for TP1.
     This is helpful for return-logits performance and debugging. '''
@@ -513,24 +546,57 @@ class _SyncQueue:
                 time.sleep(0.01)
 
 
-def set_sched_setaffinity(required_cores: int):
-    ''' Set the CPU affinity of the current process to the required number of
-    cores.
+def get_numa_aware_cpu_affinity(device_id):
+    '''Query NVML for NUMA-aware CPU affinity for the specified CUDA device.
 
-    Known issue: This may race with other processes that also set the affinity.
+    Args:
+        device_id: The CUDA device ID to query for optimal CPU affinity.
+
+    Returns:
+        List of CPU IDs representing the optimal CPU affinity mask for the device.
+
+    Raises:
+        pynvml.NVMLError: If NVML operations fail or device_id is invalid.
     '''
-    cpu_percentages = psutil.cpu_percent(percpu=True)
-    # sort the cores by usage
-    free_cores = sorted(range(len(cpu_percentages)),
-                        key=lambda i: cpu_percentages[i])
+    cpu_count = psutil.cpu_count()
 
-    pid = os.getpid()
-    os.sched_setaffinity(pid, set(free_cores[:required_cores]))
+    # If this is not a NUMA system, or we hit an exception, default to
+    # unconstrained CPU affinity
+    cpu_affinity = list(range(cpu_count))
 
+    if not os.path.isdir("/sys/devices/system/node/node1"):
+        return cpu_affinity
 
-def clear_sched_affinity(pid: int):
-    ''' Clear the CPU affinity of the current process. '''
-    os.sched_setaffinity(pid, set(range(psutil.cpu_count())))
+    try:
+        # initialize NVML
+        import pynvml
+        pynvml.nvmlInit()
+
+        # Get the number of bits per ulong
+        c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8
+
+        # Determine how large our cpu set array from NVML needs to be
+        cpu_set_size = math.ceil(cpu_count / c_ulong_bits)
+
+        # Get the optimal CPU affinity for this device according to the NUMA
+        # topology
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+        affinity_masks = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
+
+        # Convert CPU masks to python list
+        cpu_affinity = []
+        for cpu_id in range(cpu_count):
+            mask_array_index = cpu_id // c_ulong_bits
+            mask_bit_index = cpu_id % c_ulong_bits
+            if affinity_masks[mask_array_index] & (1 << mask_bit_index):
+                cpu_affinity.append(cpu_id)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except:
+            pass  # Ignore shutdown errors
+
+    return cpu_affinity
 
 
 def generate_api_docs_as_docstring(model: Type[BaseModel],

@@ -1,15 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Triton implementation of the Fused MOE ops. Inspired by vLLM's triton MOE implementation.
 """
 
 from __future__ import annotations
 
-from typing import Tuple
+import functools
+import json
+import os
+from typing import Any, Tuple
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+from tensorrt_llm._torch.utils import ActivationType  # noqa: F401
+
+from ...utils.logger import ad_logger
 
 
 @triton.jit
@@ -283,7 +305,90 @@ def fused_mlp_moe_kernel_w8a8(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-def _default_kernel_config(M: int, E: int, N: int, K: int, top_k: int) -> dict:
+# Adapted from: https://github.com/sgl-project/sglang/pull/2628
+def get_config_file_name(
+    E: int, N: int, dtype: str | None, block_shape: list[int] | None = None
+) -> str:
+    device_name = torch.cuda.get_device_name().replace(" ", "_")
+    dtype_selector = "" if not dtype else f",dtype={dtype}"
+    block_shape_selector = (
+        "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
+    ).replace(" ", "")
+    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"  # noqa: E501
+
+
+# Adapted from: https://github.com/vllm-project/vllm/blob/b4fda58a2d0e458e0186e4caa4354b3d07153c70/vllm/model_executor/layers/fused_moe/fused_moe.py#L828
+@functools.lru_cache
+def get_moe_configs(
+    E: int,
+    N: int,
+    dtype: str | None,
+    block_n: int | None = None,
+    block_k: int | None = None,
+) -> dict[int, Any] | None:
+    """
+    Return optimized configurations for the fused MoE kernel.
+
+    The return value will be a dictionary that maps an irregular grid of
+    batch sizes to configurations of the fused_moe kernel. To evaluate the
+    kernel on a given batch size bs, the closest batch size in the grid should
+    be picked and the associated configuration chosen to invoke the kernel.
+    """
+
+    # First look up if an optimized configuration is available in the configs
+    # directory
+    block_shape = [block_n, block_k] if block_n and block_k else None
+    json_file_name = get_config_file_name(E, N, dtype, block_shape)
+
+    config_file_paths = []
+
+    # note that we prioritize user defined config
+    # user_defined_config_folder = envs.VLLM_TUNED_CONFIG_FOLDER
+    user_defined_config_folder = "."
+    if user_defined_config_folder is not None:
+        user_defined_config_file_path = os.path.join(user_defined_config_folder, json_file_name)
+        config_file_paths.append(user_defined_config_file_path)
+
+    ad_folder = "triton_fused_moe_configs"
+    default_config_file_path = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), ad_folder, json_file_name
+    )
+    config_file_paths.append(default_config_file_path)
+
+    for config_file_path in config_file_paths:
+        if os.path.exists(config_file_path):
+            with open(config_file_path) as f:
+                ad_logger.info(f"Using configuration from {config_file_path} for MoE layer.")
+                # If a configuration has been found, return it
+                tuned_config = json.load(f)
+                # Delete triton_version from tuned_config
+                tuned_config.pop("triton_version", None)
+                return {int(key): val for key, val in tuned_config.items()}
+
+    # If no optimized configuration is available, we will use the default
+    # configuration
+    ad_logger.warning(
+        ("Using default MoE config. Performance might be sub-optimal! Config file not found at %s"),
+        config_file_paths,
+    )
+    return None
+
+
+def _get_kernel_config(
+    M: int, E: int, N: int, dtype: str | None, block_shape: list[int] | None = None
+) -> dict:
+    configs = get_moe_configs(E, N, dtype=None)
+    if configs:
+        # If an optimal configuration map has been found, look up the
+        # optimal config (closest batch size)
+        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+    else:
+        # Else use the default config
+        config = _default_kernel_config(M, E)
+    return config
+
+
+def _default_kernel_config(M: int, E: int) -> dict:
     if M <= E:
         return {
             "BLOCK_SIZE_M": 16,
@@ -461,7 +566,7 @@ def _fused_moe_mlp_relu2(
     E, inter_size, _ = w_up.shape
     top_k = topk_ids.shape[1]
 
-    config = _default_kernel_config(M, E, inter_size, H, top_k)
+    config = _get_kernel_config(M, E, inter_size, H, top_k)
     sorted_token_ids, expert_ids, num_tokens_post_padded = _pack_routed_tokens(
         topk_ids, M, E, top_k, config["BLOCK_SIZE_M"]
     )
@@ -513,11 +618,26 @@ def triton_fused_moe(
     routing_weights: torch.Tensor,
     w1_stacked_weight: torch.Tensor,
     w2_stacked_weight: torch.Tensor,
+    is_gated_mlp: bool = False,
+    act_fn: int = int(ActivationType.Relu2),
 ) -> torch.Tensor:
     """Triton unquantized MoE with 2-layer MLP and ReLU^2 activation."""
+
+    assert not is_gated_mlp, "Triton backend only supports non gated MLP style."
+    assert act_fn == ActivationType.Relu2, "Triton backend only supports relu2 activation."
+
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
-    topk_ids = selected_experts.to(torch.int32).contiguous()
+
+    # Get number of local experts from weight shape
+    num_experts = w1_stacked_weight.shape[0]
+
+    # Clamp expert IDs to valid range to handle EP sharding
+    # After EP sharding, some expert IDs may be negative (for experts on other ranks)
+    # Clamp them to 0 (first expert) - these will be masked by routing_weights=0 anyway
+    selected_experts_clamped = torch.clamp(selected_experts, min=0, max=num_experts - 1)
+
+    topk_ids = selected_experts_clamped.to(torch.int32).contiguous()
     topk_weights = routing_weights.to(torch.float32).contiguous()
 
     out2d = _fused_moe_mlp_relu2(x2d, w1_stacked_weight, w2_stacked_weight, topk_ids, topk_weights)
@@ -550,29 +670,39 @@ def triton_quant_fp8_moe(
     w1_weight: torch.Tensor,  # [E, I, H] stacked FP8 weights
     w2_weight: torch.Tensor,  # [E, H, I] stacked FP8 weights
     w3_weight: torch.Tensor,  # unused for mlp style
-    w1_input_scale: torch.Tensor,  # [E] stacked input scales
-    w2_input_scale: torch.Tensor,  # [E] stacked input scales
+    w1_input_scale: torch.Tensor,  # [1] max input scale (precomputed)
+    w2_input_scale: torch.Tensor,  # [1] max input scale (precomputed)
     w3_input_scale: torch.Tensor,  # unused
     w1_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w2_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w3_weight_scale: torch.Tensor,  # unused
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = False,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     """Triton FP8 W8A8 MoE with 2-layer MLP and ReLU^2 activation."""
-    if mlp_style != "mlp":
-        raise NotImplementedError("triton_quant_fp8_moe currently supports mlp_style=='mlp' only")
+    if is_gated_mlp:
+        raise NotImplementedError("triton_quant_fp8_moe currently supports mlp only")
 
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
-    topk_ids = selected_experts.to(torch.int32).contiguous()
+
+    # Get number of local experts from weight shape
+    num_experts = w1_weight.shape[0]
+
+    # Clamp expert IDs to valid range to handle EP sharding
+    # After EP sharding, some expert IDs may be negative (for experts on other ranks)
+    # Clamp them to 0 (first expert) - these will be masked by routing_weights=0 anyway
+    selected_experts_clamped = torch.clamp(selected_experts, min=0, max=num_experts - 1)
+
+    topk_ids = selected_experts_clamped.to(torch.int32).contiguous()
     topk_weights = routing_weights.to(torch.float32).contiguous()
 
     # Weights are already stacked [E, ...] - just ensure contiguous and extract scales
+    # Input scales are precomputed max values (consistent with trtllm backend)
     w1_q = w1_weight.contiguous()
     w2_q = w2_weight.contiguous()
-    a1_scale = w1_input_scale[0].to(torch.float32).reshape(1).contiguous()
-    a2_scale = w2_input_scale[0].to(torch.float32).reshape(1).contiguous()
+    a1_scale = w1_input_scale.to(torch.float32).reshape(1).contiguous()
+    a2_scale = w2_input_scale.to(torch.float32).reshape(1).contiguous()
     b1_scale = w1_weight_scale.to(torch.float32).contiguous()
     b2_scale = w2_weight_scale.to(torch.float32).contiguous()
 
@@ -580,7 +710,7 @@ def triton_quant_fp8_moe(
     M, H = x2d.shape
     E, inter_size, _ = w1_q.shape
     top_k = topk_ids.shape[1]
-    config = _default_kernel_config(M, E, inter_size, H, top_k)
+    config = _get_kernel_config(M, E, inter_size, H, top_k)
     sorted_token_ids, expert_ids, num_tokens_post_padded = _pack_routed_tokens(
         topk_ids, M, E, top_k, config["BLOCK_SIZE_M"]
     )
@@ -633,7 +763,7 @@ def triton_quant_fp8_moe(
 
 
 @triton_quant_fp8_moe.register_fake
-def triton_quant_fp8_moe(
+def triton_quant_fp8_moe_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -646,7 +776,7 @@ def triton_quant_fp8_moe(
     w1_weight_scale: torch.Tensor,
     w2_weight_scale: torch.Tensor,
     w3_weight_scale: torch.Tensor,
-    mlp_style: str = "gated_mlp",
-    act_fn: str = "silu",
+    is_gated_mlp: bool = False,
+    act_fn: int = int(ActivationType.Silu),
 ) -> torch.Tensor:
     return torch.empty_like(x)

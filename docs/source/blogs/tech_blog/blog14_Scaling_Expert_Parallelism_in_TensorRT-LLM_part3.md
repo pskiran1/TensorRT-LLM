@@ -1,8 +1,8 @@
 # Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)
 
 This blog post is a continuation of previous posts:
-* [Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
-* [Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md)
+* [Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
+* [Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md)
 
 In this blog post, we focus on performance optimization, diving deeper into techniques such as lower precision, network structure refactoring, and aggressive kernel fusion. We hope this analysis and optimization process brings new inspiration to your model inference optimization work.
 
@@ -38,7 +38,7 @@ Let's firstly take a look at how the network structure looks like before we did 
 </div>
 <p align="center"><sub><em>Figure 1: Network structure overview before optimization</em></sub></p>
 
-In this third blog of our scaling Expert Parallelism (EP) series, we push the performance boundaries of large-scale EP on NVIDIA GB200 NVL72 through multiple optimization techniques. Building upon the foundation established in [part 1](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md) and [part 2](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md), this blog explores three key optimization pillars: **lower precision computation** (including FP4 quantization for wo GEMM, low-precision AlltoAll communication, and FP8 context FMHA), **network structure rethinking** (featuring MTP LM head tensor parallelism and context phase Q/K/V concatenation elimination), and **aggressive kernel fusion and overlap** (leveraging Programmatic Dependent Launch, fused AlltoAll operations, and torch.compile optimizations). These optimizations collectively deliver significant end-to-end performance improvements for wide-EP scenarios on NVIDIA GB200 NVL72, for DeepSeek R1 with its specialized Multi-head Latent Attention (MLA) mechanism. Each technique is carefully designed to maintain accuracy while maximizing performance, demonstrating the power of combining algorithmic innovation with deep hardware awareness.
+In this third blog of our scaling Expert Parallelism (EP) series, we push the performance boundaries of large-scale EP on NVIDIA GB200 NVL72 through multiple optimization techniques. Building upon the foundation established in [part 1](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md) and [part 2](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md), this blog explores three key optimization pillars: **lower precision computation** (including FP4 quantization for wo GEMM, low-precision AlltoAll communication, and FP8 context FMHA), **network structure rethinking** (featuring MTP LM head tensor parallelism and context phase Q/K/V concatenation elimination), and **aggressive kernel fusion and overlap** (leveraging Programmatic Dependent Launch, fused AlltoAll operations, and torch.compile optimizations). These optimizations collectively deliver significant end-to-end performance improvements for wide-EP scenarios on NVIDIA GB200 NVL72, for DeepSeek R1 with its specialized Multi-head Latent Attention (MLA) mechanism. Each technique is carefully designed to maintain accuracy while maximizing performance, demonstrating the power of combining algorithmic innovation with deep hardware awareness.
 
 ## Lower precision
 
@@ -46,7 +46,7 @@ In this third blog of our scaling Expert Parallelism (EP) series, we push the pe
 
 The wo GEMM is the final linear layer within the multi-head attention block that produces the final outputs. While DeepSeek R1's MLA modifies the initial projections for keys and values, the wo GEMM operator remains a critical and standard component for finalizing the attention computation. In the term, "wo" is the abbreviation for the weight matrix for the output.
 
-We've evaluated that quantizing the wo GEMM to FP4 still satisfies the accuracy requirements, maintaining a similar MTP accept rate (AR) while improving end-to-end performance. The [NVIDIA TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) team has published checkpoints that additionally quantize the wo module in attention layers to FP4 on HuggingFace:
+We've evaluated that quantizing the wo GEMM to FP4 still satisfies the accuracy requirements, maintaining a similar MTP accept rate (AR) while improving end-to-end performance. The [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) team has published checkpoints that additionally quantize the wo module in attention layers to FP4 on HuggingFace:
 * https://huggingface.co/nvidia/DeepSeek-R1-FP4-v2
 * https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2
 

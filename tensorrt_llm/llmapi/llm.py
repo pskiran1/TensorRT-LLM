@@ -7,8 +7,9 @@ import tempfile
 import time
 import weakref
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Sequence, Union
+from typing import Any, List, Literal, Optional, Sequence, Tuple, Union, cast
 
 import transformers
 from tqdm import tqdm
@@ -17,7 +18,8 @@ from transformers import PreTrainedTokenizerBase
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
-from tensorrt_llm.inputs.registry import DefaultInputProcessor
+from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+                                          DefaultInputProcessor)
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
 
@@ -30,7 +32,8 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
-from ..executor.utils import (create_mpi_comm_session,
+from ..executor.request import DEFAULT_REQUEST_PRIORITY
+from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, create_input_processor,
                       create_input_processor_with_hash, get_cache_salt_id,
@@ -59,7 +62,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         prompt_token_ids (List[int]): The token ids of the prompt.
         outputs (List[CompletionOutput]): The output sequences of the request.
         context_logits (torch.Tensor, optional): The logits on the prompt token ids.
-        mm_embedding_handle (Dict[str, Any], optional): The multimodal embedding handle of the request.
+        disaggregated_params (DisaggregatedParams, optional): Parameters for disaggregated serving, including multimodal embedding handles.
         finished (bool): Whether the whole request is finished.
     """
 
@@ -88,8 +91,12 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
 
     def _repr_fields(self):
         return [
-            "request_id", "prompt", "prompt_token_ids", "outputs", "finished",
-            "mm_embedding_handle"
+            "request_id",
+            "prompt",
+            "prompt_token_ids",
+            "outputs",
+            "finished",
+            "disaggregated_params",
         ]
 
 
@@ -99,6 +106,7 @@ TRT_LLM_DOCSTRING = TRT_LLMARGS_EXPLICIT_DOCSTRING + """
         tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
         workspace (pathlib.Path): The directory to store intermediate files.
         llm_id (str): The unique ID of the LLM instance.
+        disaggregated_params (dict): The disaggregated parameters of the LLM instance.
 """
 
 TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
@@ -106,7 +114,20 @@ TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
     Attributes:
         tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
         llm_id (str): The unique ID of the LLM instance.
+        disaggregated_params (dict): The disaggregated parameters of the LLM instance.
 """
+
+
+@dataclass
+class PreprocessedInputs:
+    """Light structure for holding preprocessed inputs.
+
+    Can be passed to `generate_async` to skip preprocessing.
+    """
+
+    prompt_token_ids: List[int]
+    query_token_ids: Optional[List[int]] = None
+    multimodal_params: Optional[MultimodalParams] = None
 
 
 class BaseLLM:
@@ -130,11 +151,15 @@ class BaseLLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
+        self._disaggregated_params: Optional[dict] = None
 
         log_level = logger.level
         logger.set_level("info")  # force display the backend
 
         try:
+            env_overrides = kwargs.get("env_overrides", None)
+            self._process_env_overrides(env_overrides)
+
             backend = kwargs.get('backend', None)
             if backend == "pytorch":
                 logger.info("Using LLM with PyTorch backend")
@@ -164,17 +189,16 @@ class BaseLLM:
                         f"{self.__class__.__name__} got invalid argument: {key}"
                     )
 
-            self.args = llm_args_cls.from_kwargs(
-                model=model,
-                tokenizer=tokenizer,
-                tokenizer_mode=tokenizer_mode,
-                skip_tokenizer_init=skip_tokenizer_init,
-                trust_remote_code=trust_remote_code,
-                tensor_parallel_size=tensor_parallel_size,
-                dtype=dtype,
-                revision=revision,
-                tokenizer_revision=tokenizer_revision,
-                **kwargs)
+            self.args = llm_args_cls(model=model,
+                                     tokenizer=tokenizer,
+                                     tokenizer_mode=tokenizer_mode,
+                                     skip_tokenizer_init=skip_tokenizer_init,
+                                     trust_remote_code=trust_remote_code,
+                                     tensor_parallel_size=tensor_parallel_size,
+                                     dtype=dtype,
+                                     revision=revision,
+                                     tokenizer_revision=tokenizer_revision,
+                                     **kwargs)
 
         except Exception as e:
             logger.error(
@@ -189,7 +213,7 @@ class BaseLLM:
         self.mpi_session = self.args.mpi_session
 
         if self.args.parallel_config.is_multi_gpu:
-            if get_device_count(
+            if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(
                     f"Only {get_device_count()} GPUs are available, but {self.args.parallel_config.world_size} are required."
@@ -225,13 +249,31 @@ class BaseLLM:
 
             self.runtime_context: Optional[_ModelRuntimeContext] = None
             self.llm_build_stats = LlmBuildStats()
-
             self._build_model()
 
         except Exception:
             if self.mpi_session is not None:
                 self.mpi_session.shutdown()
             raise
+
+        # --- Usage telemetry (fail-silent) ---
+        try:
+            import tensorrt_llm.usage as _usage
+            telemetry_config = getattr(self.args, 'telemetry_config', None)
+            # Promote UNKNOWN -> LLM_CLASS for direct Python API usage.
+            # CLI commands set their specific context before LLM construction,
+            # so this only fires for users calling LLM() directly.
+            if telemetry_config is not None:
+                if telemetry_config.usage_context == _usage.UsageContext.UNKNOWN:
+                    telemetry_config = telemetry_config.model_copy(
+                        update={"usage_context": _usage.UsageContext.LLM_CLASS})
+            _usage.report_usage(
+                llm_args=self.args,
+                pretrained_config=self._hf_model_config,
+                telemetry_config=telemetry_config,
+            )
+        except Exception as exc:
+            logger.debug("Usage telemetry setup failed: %s", exc)
 
         try:
             if self.args.otlp_traces_endpoint:
@@ -256,6 +298,14 @@ class BaseLLM:
 
         return self._llm_id
 
+    @property
+    @set_api_status("beta")
+    def disaggregated_params(self) -> dict:
+        if self._disaggregated_params is None:
+            self._disaggregated_params = self._executor.get_disaggregated_params(
+            ) if self._executor else {}
+        return self._disaggregated_params
+
     def generate(
         self,
         inputs: Union[PromptInputs, Sequence[PromptInputs]],
@@ -273,6 +323,7 @@ class BaseLLM:
         scheduling_params: Optional[Union[SchedulingParams,
                                           List[SchedulingParams]]] = None,
         cache_salt: Optional[Union[str, Sequence[str]]] = None,
+        priority: Union[float, List[float]] = DEFAULT_REQUEST_PRIORITY,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -294,6 +345,7 @@ class BaseLLM:
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], optional):
                 Scheduling parameters. Defaults to None.
             cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
+            priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
@@ -306,6 +358,20 @@ class BaseLLM:
             inputs = [inputs]
 
         inputs = [prompt_inputs(i) for i in inputs]
+
+        if isinstance(priority, list):
+            if len(priority) != len(inputs):
+                raise ValueError(
+                    f"priority list length ({len(priority)}) does not match "
+                    f"number of prompts ({len(inputs)})")
+            for p in priority:
+                if not (0.0 <= p <= 1.0):
+                    raise ValueError(
+                        f"priority must be a float in [0.0, 1.0], got {p}")
+        else:
+            if not (0.0 <= priority <= 1.0):
+                raise ValueError(
+                    f"priority must be a float in [0.0, 1.0], got {priority}")
 
         def _item_at(maybe_batched: Union[Any, Sequence[Any]], pos: int) -> Any:
             if isinstance(maybe_batched, list):
@@ -325,6 +391,7 @@ class BaseLLM:
                 disaggregated_params=_item_at(disaggregated_params, i),
                 scheduling_params=_item_at(scheduling_params, i),
                 cache_salt=_item_at(cache_salt, i),
+                priority=_item_at(priority, i),
                 streaming=False,
             )
             futures.append(future)
@@ -343,7 +410,7 @@ class BaseLLM:
     @nvtx_range_debug("LLM.generate_async", color="green", category="LLM")
     def generate_async(
         self,
-        inputs: PromptInputs,
+        inputs: Union[PromptInputs, PreprocessedInputs],
         sampling_params: Optional[SamplingParams] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
@@ -354,12 +421,13 @@ class BaseLLM:
         _postproc_params: Optional[PostprocParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
+        priority: float = DEFAULT_REQUEST_PRIORITY,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
 
         Args:
-            inputs (tensorrt_llm.inputs.data.PromptInputs): The prompt text or token ids; it must be single prompt.
+            inputs (Union[tensorrt_llm.inputs.data.PromptInputs, tensorrt_llm.llmapi.llm.PreprocessedInputs]): The prompt text or token ids, or a `PreprocessedInputs` returned by `preprocess`. If the latter, preprocessing will be skipped by this method.
             sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
             lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.
@@ -370,6 +438,7 @@ class BaseLLM:
             trace_headers (Mapping[str, str], optional): Trace headers. Defaults to None.
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
+            priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
@@ -378,10 +447,8 @@ class BaseLLM:
         if self._executor is None or self._executor.is_shutdown():
             raise RuntimeError("LLM is shutting down")
 
-        arrival_time = steady_clock_now(
-        ) if self.args.return_perf_metrics else None
-
         sampling_params = self._prepare_sampling_params(sampling_params)
+
         cache_salt_id = get_cache_salt_id(
             cache_salt) if cache_salt is not None else None
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
@@ -389,99 +456,21 @@ class BaseLLM:
         # TODO: Also support for trt backend
         is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
         is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
-        is_mm_disagg = disaggregated_params is not None and disaggregated_params.multimodal_embedding_handles is not None
 
         if is_ctx_only and not self._on_trt_backend:
             sampling_params.max_tokens = 1
 
-        inputs = prompt_inputs(inputs)
-
-        if not inputs.get("prompt") and inputs.get("prompt_token_ids") and (
-                inputs.get("multi_modal_data")
-                or inputs.get("multi_modal_embeddings")) and not isinstance(
-                    self.input_processor, DefaultInputProcessor):
-            # VLMs need to process/tokenize the prompt in their own way
-            prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
-            inputs = TextPrompt(
-                prompt=prompt,
-                multi_modal_data=inputs.get("multi_modal_data"),
-                mm_processor_kwargs=inputs.get("mm_processor_kwargs"))
-            if sampling_params.add_special_tokens:
-                logger.debug(
-                    "Setting add_special_tokens to False because prompt_token_ids were provided to generate. VLMs will re-encode the prompt."
-                )
-                sampling_params.add_special_tokens = False
-
-        query_token_ids = None
-        multimodal_params = None
-
-        if is_mm_disagg:
-            if not self.input_processor.support_mm_disagg:
-                raise ValueError(
-                    "Multimodal disaggregated inference is not supported for this model"
-                )
-            mm_handles = disaggregated_params.multimodal_embedding_handles
-            prompt_token_ids, mm_token_length, mm_token_positions = self.input_processor.get_prompt_token_ids(
-                inputs, mm_handles)
-            prompt = inputs.get("prompt", None)
-            query_token_ids = inputs.get("query_token_ids", None)
-            if is_gen_only:
-                # TODO: support generation-only mode for multimodal disaggregated inference
-                # Need to set multimodal_params = None; but not tested yet
-                raise ValueError(
-                    "Multimodal disaggregated inference is not supported for generation-only mode"
-                )
-            else:
-                mm_hashes = disaggregated_params.multimodal_hashes
-                multimodal_input = MultimodalInput.from_components(
-                    mm_hashes, mm_token_positions, mm_token_length)
-                multimodal_params = MultimodalParams(
-                    multimodal_input=multimodal_input,
-                    multimodal_data={"multimodal_embedding": mm_handles})
-
-        elif "prompt_token_ids" in inputs:
-            prompt_token_ids = inputs['prompt_token_ids']
+        if isinstance(inputs, PreprocessedInputs):
+            prompt_token_ids = inputs.prompt_token_ids
             prompt = None
-            query_token_ids = inputs.get("query_token_ids", None)
-        elif "prompt" in inputs:
-            if 'multi_modal_data' in inputs:
-                # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
-                # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
-                # In the future, we should refactor this to:
-                # 1. Extend support for more modalities and models
-                # 2. Decouple input processor into distinct phases (preprocessor (all preprocessing logics), vision model (fuse in model fwd), etc.
-                input_processor_with_hash = create_input_processor_with_hash(
-                    self.input_processor)
-                with nvtx_range_debug("input_processor_with_hash"):
-                    prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
-                        inputs, sampling_params)
-            elif 'multi_modal_embeddings' in inputs:
-                mm_embedding_info = inputs['multi_modal_embeddings']
-                prompt_token_ids, extra_processed_inputs = self.input_processor.attach_multimodal_embeddings(
-                    inputs, mm_embedding_info, sampling_params)
-            else:
-                with nvtx_range_debug("input_processor"):
-                    prompt_token_ids, extra_processed_inputs = self.input_processor(
-                        inputs, sampling_params)
-            prompt = inputs['prompt']
-            if extra_processed_inputs is not None:
-                query_token_ids = extra_processed_inputs.get('query_token_ids')
-                # Create unified MultimodalParams
-                multimodal_params = MultimodalParams(
-                    multimodal_input=extra_processed_inputs.get(
-                        'multimodal_input'),
-                    multimodal_data=extra_processed_inputs.get(
-                        'multimodal_data'))
-                # Only pass it if it has content
-                if not multimodal_params.has_content():
-                    multimodal_params = None
-                else:
-                    # Convert to shared tensor handle to reduce IPC overhead
-                    multimodal_params.to_handle("multimodal_data")
+            query_token_ids = inputs.query_token_ids
+            multimodal_params = inputs.multimodal_params
         else:
-            raise TypeError(
-                f"The inputs must be type str or list of int, but got {type(inputs)}"
-            )
+            prompt_token_ids, prompt, query_token_ids, multimodal_params = (
+                self._preprocess(inputs, sampling_params, disaggregated_params))
+
+        arrival_time = steady_clock_now(
+        ) if self.args.return_perf_metrics else None
 
         self._check_arguments(
             len(prompt_token_ids),
@@ -506,6 +495,7 @@ class BaseLLM:
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id,
             arrival_time=arrival_time,
+            priority=priority,
         )
 
         if sampling_params.return_perf_metrics:
@@ -514,6 +504,215 @@ class BaseLLM:
 
         return RequestOutput._from_generation_result(result, prompt,
                                                      self.tokenizer)
+
+    def _preprocess(
+        self,
+        inputs: PromptInputs,
+        sampling_params: SamplingParams,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
+    ) -> Tuple[List[int], Optional[str], Optional[List[int]],
+               Optional[MultimodalParams]]:
+        """Preprocess raw prompts into token IDs and multimodal params.
+
+        This is the CPU-heavy portion of generate_async (tokenization,
+        multimodal processing, hash computation).
+
+        Returns:
+            `(prompt_token_ids, prompt, query_token_ids, multimodal_params)`
+        """
+        inputs = prompt_inputs(inputs)
+
+        # A fast path for token IDs & MM data is available for a VLM if the input processor has the following methods.
+        # TODO: Once all the VLMs support the fast path, remove this flag and modify the remaining logic accordingly.
+        use_token_ids_for_mm_placeholders = (
+            hasattr(self.input_processor, "get_text_with_mm_placeholders")
+            and hasattr(self.input_processor, "expand_prompt_token_ids_for_mm"))
+
+        # This IF branch is applicable, whenever:
+        # - multimodal data is present (whether through embeddings or as preprocessed data), AND
+        # - token IDs are present, AND
+        # - two methods defining the placeholder token IDs expansion logic are not available.
+        if not inputs.get("prompt") and inputs.get("prompt_token_ids") and (
+                inputs.get("multi_modal_data")
+                or inputs.get("multi_modal_embeddings")) and not isinstance(
+                    self.input_processor, DefaultInputProcessor
+                ) and not use_token_ids_for_mm_placeholders:
+            # VLMs need to process/tokenize the prompt in their own way,
+            # if they don't have the fast path for token IDs & MM data implemented yet.
+            # TODO: Once all the VLMs support the fast path, we can remove this detokenization step entirely.
+            prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
+            inputs = TextPrompt(
+                prompt=prompt,
+                multi_modal_data=inputs.get("multi_modal_data"),
+                mm_processor_kwargs=inputs.get("mm_processor_kwargs") or {})
+            if sampling_params.add_special_tokens:
+                logger.debug(
+                    "Setting add_special_tokens to False because prompt_token_ids were provided to generate. VLMs will re-encode the prompt."
+                )
+                sampling_params.add_special_tokens = False
+
+        is_mm_disagg = (disaggregated_params is not None
+                        and disaggregated_params.multimodal_embedding_handles
+                        is not None)
+        is_gen_only = (disaggregated_params is not None and
+                       disaggregated_params.request_type == "generation_only")
+
+        query_token_ids = None
+        multimodal_params = None
+        prompt = None
+
+        # This branch is applicable for Encode --> Prefill handoff scenario,
+        # in E/P/D/ and E/PD settings. Prefill worker executes this code path.
+        if is_mm_disagg:
+            if not getattr(self.input_processor, "support_mm_disagg", False):
+                raise ValueError(
+                    "Multimodal disaggregated inference is not supported for this model"
+                )
+            mm_handles = disaggregated_params.multimodal_embedding_handles
+            prompt_token_ids, mm_token_length, mm_token_positions = self.input_processor.get_prompt_token_ids(
+                inputs, mm_handles)
+            prompt = inputs.get("prompt", None)
+            query_token_ids = inputs.get("query_token_ids", None)
+            if is_gen_only:
+                raise ValueError(
+                    "Generation-only mode should not need multimodal parameters"
+                )
+            else:
+                mm_hashes = disaggregated_params.multimodal_hashes
+                multimodal_input = MultimodalInput.from_components(
+                    mm_hashes, mm_token_positions, mm_token_length)
+                multimodal_data = {"multimodal_embedding": mm_handles}
+                if disaggregated_params.mrope_position_ids_handle is not None:
+                    # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
+                    assert disaggregated_params.mrope_position_deltas_handle is not None
+                    mrope_config = {}
+                    mrope_config[
+                        "mrope_position_ids"] = disaggregated_params.mrope_position_ids_handle
+                    mrope_config[
+                        "mrope_position_deltas"] = disaggregated_params.mrope_position_deltas_handle
+                    multimodal_data["mrope_config"] = mrope_config
+                multimodal_params = MultimodalParams(
+                    multimodal_input=multimodal_input,
+                    multimodal_data=multimodal_data,
+                )
+        # This condition is to ensure that this branch is not hit for models that expand
+        # placeholder token IDs with MM data.
+        elif ("prompt_token_ids" in inputs
+              and inputs.get("multi_modal_data") is None
+              and inputs.get("multi_modal_embeddings") is None):
+            prompt_token_ids = inputs['prompt_token_ids']
+            query_token_ids = inputs.get("query_token_ids", None)
+            multimodal_data = {}
+            # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
+            if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
+                # PyTorchModelEngine assumes both are present when using mrope.
+                if disaggregated_params.mrope_position_deltas_handle is None:
+                    raise RuntimeError(
+                        "`mrope_position_ids_handle` and `mrope_position_deltas_handle` must both "
+                        "be provided, or both `None`.")
+                mrope_config = {}
+                mrope_config[
+                    "mrope_position_ids"] = disaggregated_params.mrope_position_ids_handle
+                mrope_config[
+                    "mrope_position_deltas"] = disaggregated_params.mrope_position_deltas_handle
+                multimodal_data["mrope_config"] = mrope_config
+            if multimodal_data:
+                multimodal_params = MultimodalParams(
+                    multimodal_data=multimodal_data)
+        # This is the fast path for token IDs & MM data, as well as the slow path for text prompt and/or MM data,
+        # for both encode or aggregated workers.
+        elif "prompt" in inputs or ("prompt_token_ids" in inputs and
+                                    (("multi_modal_data" in inputs
+                                      or "multi_modal_embeddings" in inputs))):
+            if 'multi_modal_data' in inputs:
+                # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
+                # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
+                # In the future, we should refactor this to:
+                # 1. Extend support for more modalities and models
+                # 2. Decouple input processor into distinct phases (preprocessor (all preprocessing logics), vision model (fuse in model fwd), etc.
+                input_processor_with_hash = create_input_processor_with_hash(
+                    self.input_processor)
+                with nvtx_range_debug("input_processor_with_hash"):
+                    prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
+                        inputs, sampling_params)
+            elif 'multi_modal_embeddings' in inputs:
+                mm_embedding_info = inputs['multi_modal_embeddings']
+                prompt_token_ids, extra_processed_inputs = cast(
+                    BaseMultimodalInputProcessor,
+                    self.input_processor).attach_multimodal_embeddings(
+                        inputs, mm_embedding_info, sampling_params)
+            else:
+                with nvtx_range_debug("input_processor"):
+                    prompt_token_ids, extra_processed_inputs = self.input_processor(
+                        inputs, sampling_params)
+            prompt = inputs.get(
+                "prompt")  # This is the text prompt, if present.
+            if extra_processed_inputs is not None:
+                query_token_ids = extra_processed_inputs.get('query_token_ids')
+                # Create unified MultimodalParams
+                multimodal_params = MultimodalParams(
+                    multimodal_input=extra_processed_inputs.get(
+                        'multimodal_input'),
+                    multimodal_data=extra_processed_inputs.get(
+                        'multimodal_data'))
+                # Only pass it if it has content
+                if not multimodal_params.has_content():
+                    multimodal_params = None
+                else:
+                    # Convert to shared tensor handle to reduce IPC overhead
+                    multimodal_params.to_handle("multimodal_data")
+                    if (disaggregated_params is not None) and (
+                            "mrope_config"
+                            in multimodal_params.multimodal_data):
+                        # Propagate mRoPE handles during context-only P -> D so decode-only
+                        # can rebuild mrope_config without raw multimodal inputs.
+                        mrope_config = multimodal_params.multimodal_data[
+                            "mrope_config"]
+                        mrope_position_ids = mrope_config.get(
+                            "mrope_position_ids")
+                        mrope_position_deltas = mrope_config.get(
+                            "mrope_position_deltas")
+                        if (mrope_position_ids is not None
+                                and mrope_position_deltas is not None):
+                            disaggregated_params.mrope_position_ids_handle = (
+                                mrope_position_ids)
+                            disaggregated_params.mrope_position_deltas_handle = (
+                                mrope_position_deltas)
+        else:
+            raise TypeError(
+                f"The inputs must be type str or list of int, but got {type(inputs)}"
+            )
+
+        return prompt_token_ids, prompt, query_token_ids, multimodal_params
+
+    @set_api_status("prototype")
+    def preprocess(
+        self,
+        inputs: PromptInputs,
+        sampling_params: Optional[SamplingParams] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
+    ) -> PreprocessedInputs:
+        """Preprocess raw prompts into token IDs and multimodal params.
+
+        Args:
+            inputs (tensorrt_llm.inputs.data.PromptInputs): The prompt text or token ids; it must be single prompt.
+            sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
+                A default one will be used if not provided.
+            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
+
+        Returns:
+            tensorrt_llm.llmapi.llm.PreprocessedInputs: A preprocessed-inputs object that can be
+                passed directly to :meth:`generate_async` as ``inputs``.
+        """
+        sampling_params = self._prepare_sampling_params(sampling_params)
+        prompt_token_ids, _prompt, query_token_ids, multimodal_params = (
+            self._preprocess(inputs, sampling_params, disaggregated_params))
+
+        return PreprocessedInputs(
+            prompt_token_ids=prompt_token_ids,
+            query_token_ids=query_token_ids,
+            multimodal_params=multimodal_params,
+        )
 
     @set_api_status("beta")
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:
@@ -524,8 +723,8 @@ class BaseLLM:
             timeout (float, optional): Max wait time in seconds when retrieving stats from queue. Defaults to 2.
 
         Returns:
-            List[dict]: A list of runtime stats as dict.
-                e.g., ['{"cpuMemUsage": ..., "iter": 0, ...}', '{"cpuMemUsage": ..., "iter": 1, ...}']
+            List[dict]: A list of runtime stats as dicts.
+                e.g., [{"cpuMemUsage": ..., "iter": 0, ...}, {"cpuMemUsage": ..., "iter": 1, ...}]
         '''
         return self._executor.get_stats(timeout=timeout)
 
@@ -582,12 +781,31 @@ class BaseLLM:
             - set `enable_block_reuse` to True in the `KvCacheConfig`.
 
         Args:
-            timeout (float, optional): Max wait time in seconds when retrieving events from queue. . Defaults to 2.
+            timeout (float, optional): Max wait time in seconds when retrieving events from queue. Defaults to 2.
 
         Returns:
             tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime events.
         '''
         return self._executor.aget_kv_events(timeout=timeout)
+
+    def _process_env_overrides(self,
+                               env_overrides: Optional[dict[str, str]]) -> None:
+        if env_overrides is None:
+            return
+        logger.info("Processing LLM API environment variable overrides")
+        # TODO: If an env var is cached at import-time in code, overriding os.environ will
+        # unfortunately not update wherever the var is used.
+        # This is a known issue and only way to fix it is at every such usage to access it
+        # from os.environ on-demand.
+        for key, value in env_overrides.items():
+            str_value = str(value)
+            if key in os.environ:
+                old_value = os.environ[key]
+                os.environ[key] = str_value
+                logger.info(f"Overriding {key}: '{old_value}' -> '{str_value}'")
+            else:
+                os.environ[key] = str_value
+                logger.info(f"Setting {key}='{str_value}'")
 
     def _prepare_sampling_params(
             self,
@@ -607,12 +825,12 @@ class BaseLLM:
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
             )
 
-        # auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.
+        # auto enable context and/or generation logits flags, as they are required by logprob computation for TRT backend.
         if self.args.backend not in ["pytorch", "_autodeploy"]:
             if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
                 sampling_params.return_context_logits = True
                 sampling_params._context_logits_auto_enabled = True
-            if sampling_params.logprobs and not sampling_params.return_generation_logits:
+            if sampling_params.logprobs is not None and not sampling_params.return_generation_logits:
                 sampling_params.return_generation_logits = True
                 sampling_params._generation_logits_auto_enabled = True
 
@@ -632,18 +850,18 @@ class BaseLLM:
             if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
                 max_num_tokens = self.args.max_num_tokens
                 if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
-                    raise ValueError(
+                    raise RequestError(
                         f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) should not exceed "
                         f"max_num_tokens ({max_num_tokens})")
             return
 
         build_config = self.args.build_config
 
-        built_enging_cfg_file = Path(self.args.model) / 'config.json'
-        with open(built_enging_cfg_file) as f:
-            built_enging_cfg = json.load(f)
-        max_seq_len = built_enging_cfg['build_config'][
-            'max_seq_len'] if 'build_config' in built_enging_cfg else build_config.max_seq_len
+        built_engine_cfg_file = Path(self.args.model) / 'config.json'
+        with open(built_engine_cfg_file) as f:
+            built_engine_cfg = json.load(f)
+        max_seq_len = built_engine_cfg['build_config'][
+            'max_seq_len'] if 'build_config' in built_engine_cfg else build_config.max_seq_len
         # TODO: Remove this check and left the request verification to cpp runtime
 
         if (not self.args.enable_chunked_prefill) and (
@@ -683,7 +901,7 @@ class BaseLLM:
                 f"Example: LLM(..., build_config=BuildConfig(gather_context_logits=True))."
             )
 
-        if sampling_params.logprobs and not self.args.gather_generation_logits:
+        if sampling_params.logprobs is not None and not self.args.gather_generation_logits:
             raise ValueError(
                 f"`sampling_params.logprobs={sampling_params.logprobs}` requires `gather_generation_logits=True` "
                 f"to be passed explicitly to the `LLM()` constructor.")
@@ -768,6 +986,17 @@ class BaseLLM:
             self.mpi_session.shutdown()
             self.mpi_session = None
 
+    def _check_health(self) -> bool:
+        """Check if the LLM is healthy.
+
+        Returns:
+            bool: True if the executor is running and not shutdown, False otherwise.
+        """
+        if hasattr(self, "_executor") and self._executor is not None:
+            return not self._executor.is_shutdown()
+
+        return False
+
     @staticmethod
     def _shutdown_wrapper(self_ref):
         # Retrieve the instance if it still exists
@@ -778,7 +1007,10 @@ class BaseLLM:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+    def __exit__(
+        self, exc_type, exc_value, traceback
+    ) -> Literal[
+            False]:  # https://github.com/microsoft/pyright/issues/7009#issuecomment-1894135045
         del exc_value, traceback
         self.shutdown()
         return False  # propagate exceptions
@@ -809,8 +1041,6 @@ class _TrtLLM(BaseLLM):
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
-        # TODO: deprecate backend in LLM kwargs
-
         super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
                          trust_remote_code, tensor_parallel_size, dtype,
                          revision, tokenizer_revision, **kwargs)
@@ -853,7 +1083,14 @@ class _TrtLLM(BaseLLM):
         # Tokenizer and config loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
-        self._hf_model_config = self._try_load_hf_model_config()
+        # Load HF config from the original HF model dir when available,
+        # since self.args.model now points to the engine dir (whose
+        # config.json uses TRT-LLM schema, not HF schema).
+        if self._hf_model_dir is not None:
+            self._hf_model_config = ModelLoader.load_hf_model_config(
+                self._hf_model_dir)
+        else:
+            self._hf_model_config = self._try_load_hf_model_config()
         self._generation_config = self._try_load_generation_config()
 
         # Multimodal special handling:
@@ -994,7 +1231,6 @@ class _TorchLLM(BaseLLM):
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
-        # TODO: deprecate backend in LLM kwargs
         backend = kwargs.pop("backend", "pytorch")
 
         # Validate that users don't pass TrtLlmArgs-specific arguments
@@ -1013,12 +1249,14 @@ class _TorchLLM(BaseLLM):
                          **kwargs)
 
     @set_api_status("prototype")
-    def _collective_rpc(self,
-                        method: str,
-                        args: tuple[Any, ...] = (),
-                        kwargs: Optional[dict] = None,
-                        non_block: bool = False,
-                        unique_reply_rank: Optional[int] = None) -> list[Any]:
+    def _collective_rpc(
+            self,
+            method: str,
+            args: tuple[Any, ...] = (),
+            kwargs: Optional[dict] = None,
+            non_block: bool = False,
+            unique_reply_rank: Optional[int] = None,
+            target_ranks: int | list[int] | None = None) -> list[Any]:
         """
         Execute an RPC call on all GPU workers. Currently, this is only supported for RayExecutor.
 
@@ -1028,13 +1266,15 @@ class _TorchLLM(BaseLLM):
             kwargs (dict, optional): Keyword arguments to pass to the worker method. Defaults to None.
             non_block (bool): Whether to block until all workers have completed the RPC call. Defaults to False.
             unique_reply_rank (int, optional): The rank of the worker that will be used to send the reply. Defaults to None.
+            target_ranks: (int, list[int], optional): The rank(s) of the worker(s) that will be used to send the reply. Defaults to None.
 
         Returns:
             list[Any]: A list of results from each worker.
         """
         if hasattr(self._executor, 'collective_rpc'):
             return self._executor.collective_rpc(method, args, kwargs,
-                                                 non_block, unique_reply_rank)
+                                                 non_block, unique_reply_rank,
+                                                 target_ranks)
         else:
             raise ValueError(
                 f"Executor type {type(self._executor)} does not support collective RPC."
@@ -1054,9 +1294,14 @@ class _TorchLLM(BaseLLM):
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
         checkpoint_format = getattr(self.args, "checkpoint_format", None)
+        input_processor_kwargs = {}
+        if self.args.video_pruning_rate is not None:
+            input_processor_kwargs[
+                'video_pruning_rate'] = self.args.video_pruning_rate
         self.input_processor = create_input_processor(self._hf_model_dir,
                                                       self.tokenizer,
-                                                      checkpoint_format)
+                                                      checkpoint_format,
+                                                      **input_processor_kwargs)
         self._tokenizer = self.input_processor.tokenizer
 
         # TODO: revisit gather_context_logits

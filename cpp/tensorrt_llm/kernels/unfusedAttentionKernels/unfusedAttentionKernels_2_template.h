@@ -18,6 +18,7 @@
 // Separate from unfusedAttentionKernel to accelerate compiling.
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -30,8 +31,8 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -300,21 +301,28 @@ inline __device__ void apply_rotary_embedding_gptj(VecType& q, VecType& k, float
     }
 }
 
-template <typename T>
+template <typename T, int VECS_PER_HEAD>
 inline __device__ void quantizeAndWriteFP4KVCache(uint8_t* kBlockScales, uint8_t* vBlockScales, uint32_t* kDst,
     uint32_t* vDst, float kSecondLevelSF, float vSecondLevelSF, int inBlockIdx, PackedVec<T>& kPacked,
     PackedVec<T>& vPacked)
 {
     uint8_t* kSfOut = nullptr;
     uint8_t* vSfOut = nullptr;
+    // WARNING: 8 elements per thread is assumed.
     // Two threads are involved in the reduction for block scales inside
     // cvt_warp_fp16_to_fp4, but only one thread needs to write out the
     // final answer.
+    constexpr int NUM_SFS_PER_HEAD = VECS_PER_HEAD / 2;
     if (inBlockIdx % 2 == 0)
     {
         auto blockScaleIdxDst = inBlockIdx / 2;
         kSfOut = kBlockScales + blockScaleIdxDst;
-        vSfOut = vBlockScales + blockScaleIdxDst;
+        // A interleaved layout (num_tokens / 4, num_sfs_per_head, 4) is used for nvfp4 kv cache in order to achieve
+        // better performance. This is only used by trtllm-gen kernels.
+        auto tokenIdxV = blockScaleIdxDst / NUM_SFS_PER_HEAD;
+        auto headDimIdxV = blockScaleIdxDst % NUM_SFS_PER_HEAD;
+        auto blockScaleIdxDstV = (tokenIdxV / 4) * 4 * NUM_SFS_PER_HEAD + headDimIdxV * 4 + (tokenIdxV % 4);
+        vSfOut = vBlockScales + blockScaleIdxDstV;
     }
 
     // Despite the name of cvt_warp_fp16_to_fp4, it is used by
@@ -376,6 +384,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
 #endif
     constexpr bool ENABLE_8BITS_CACHE = sizeof(TCache) == 1 && !ENABLE_4BITS_CACHE;
     int const sizePerHeadDivX = params.size_per_head / VEC_SIZE;
+    // This is only used by nvfp4 kv cache where Dh_MAX is same as head size (others are not supported yet).
+    constexpr int VECS_PER_HEAD = Dh_MAX / VEC_SIZE;
     using TDst = TCache;
 
     // Variable sequence length.
@@ -416,19 +426,26 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             int const token_idx_in_seq = past_seq_len + local_token_idx;
             bool const valid_token = token_idx_in_seq < cache_seq_len;
 
-            // NOTE: only spec decoding needs the position offsets.
-            // In the generation phase, we assume all sequences should have the same input length.
-            int const rotary_position
-                = (params.spec_decoding_position_offsets != nullptr ? (
-                       params.spec_decoding_position_offsets[local_token_idx + batch_idx * params.max_input_seq_len]
-                       + past_seq_len)
-                                                                    : token_idx_in_seq)
-                + (params.mrope_position_deltas != nullptr ? params.mrope_position_deltas[batch_idx] : 0);
-
             if (!valid_token)
             {
                 continue;
             }
+
+            // NOTE: only spec decoding needs the position offsets.
+            // In the generation phase, we assume all sequences should have the same input length.
+            // Helix parallelism: use helix_position_offsets if available (absolute position).
+            int const rotary_position
+                = (params.helix_position_offsets != nullptr ? params.helix_position_offsets[global_token_idx]
+                          : params.spec_decoding_position_offsets != nullptr
+                          ? (params.spec_decoding_position_offsets[local_token_idx
+                                 + batch_idx * params.max_input_seq_len]
+                              + past_seq_len)
+                          : token_idx_in_seq)
+                + (params.mrope_position_deltas != nullptr ? params.mrope_position_deltas[batch_idx] : 0);
+
+            // Helix parallelism: determine if this rank is inactive for this request.
+            bool const helix_inactive
+                = params.helix_is_inactive_rank != nullptr && params.helix_is_inactive_rank[batch_idx];
 
             // Is the token and head dim maksed.
             bool const valid_head_dim_idx = head_dim_idx < params.size_per_head;
@@ -596,7 +613,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                         }
                     }
 
-                    if (valid_kv_cache_pos)
+                    if (valid_kv_cache_pos && !helix_inactive)
                     {
                         if constexpr (ENABLE_8BITS_CACHE)
                         {
@@ -615,9 +632,9 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                             float vSecondLevelSF = params.qkv_scale_orig_quant[2];
                             auto& kPacked = reinterpret_cast<PackedVec<T>&>(k_to_cache);
                             auto& vPacked = reinterpret_cast<PackedVec<T>&>(v);
-                            quantizeAndWriteFP4KVCache<T>(kBlockScales, vBlockScales, reinterpret_cast<uint32_t*>(kDst),
-                                reinterpret_cast<uint32_t*>(vDst), kSecondLevelSF, vSecondLevelSF, inBlockIdx, kPacked,
-                                vPacked);
+                            quantizeAndWriteFP4KVCache<T, VECS_PER_HEAD>(kBlockScales, vBlockScales,
+                                reinterpret_cast<uint32_t*>(kDst), reinterpret_cast<uint32_t*>(vDst), kSecondLevelSF,
+                                vSecondLevelSF, inBlockIdx, kPacked, vPacked);
                         }
                         else
                         {
@@ -769,7 +786,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
     // Head idx.
     int const head_idx = blockIdx.y;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
 #endif
 
     // Variable sequence length.
@@ -834,10 +851,17 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 
         // NOTE: only spec decoding needs the position offsets.
         // In the generation phase, we assume all sequences should have the same input length.
-        int const rotary_position = params.spec_decoding_position_offsets != nullptr
+        // Helix parallelism: use helix_position_offsets if available (absolute position).
+        int const rotary_position = params.helix_position_offsets != nullptr
+            ? params.helix_position_offsets[bounded_global_token_idx]
+            : params.spec_decoding_position_offsets != nullptr
             ? (params.spec_decoding_position_offsets[token_idx_in_seq + batch_idx * params.max_input_seq_len]
                 + cache_seq_len - actual_seq_len)
             : token_idx_in_kv_cache;
+
+        // Helix parallelism: determine if this rank is inactive for this request.
+        bool const helix_inactive
+            = params.helix_is_inactive_rank != nullptr && params.helix_is_inactive_rank[batch_idx];
 
         // head_num == kv_head_num:
         //   src QKV: [batch, time, 3, head_num, size_per_head]
@@ -999,7 +1023,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                     }
                 }
 
-                if (valid_kv_cache_pos)
+                if (valid_kv_cache_pos && !helix_inactive)
                 {
                     if constexpr (ENABLE_8BITS_CACHE)
                     {
@@ -1022,9 +1046,9 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                         float vSecondLevelSF = params.qkv_scale_orig_quant[2];
                         auto& kPacked = reinterpret_cast<PackedVec<T>&>(k);
                         auto& vPacked = reinterpret_cast<PackedVec<T>&>(v);
-                        quantizeAndWriteFP4KVCache<T>(kBlockScales, vBlockScales, reinterpret_cast<uint32_t*>(kDst),
-                            reinterpret_cast<uint32_t*>(vDst), kSecondLevelSF, vSecondLevelSF, inBlockIdx, kPacked,
-                            vPacked);
+                        quantizeAndWriteFP4KVCache<T, VECS_PER_HEAD>(kBlockScales, vBlockScales,
+                            reinterpret_cast<uint32_t*>(kDst), reinterpret_cast<uint32_t*>(vDst), kSecondLevelSF,
+                            vSecondLevelSF, inBlockIdx, kPacked, vPacked);
                     }
                     else
                     {
@@ -1074,7 +1098,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -1529,6 +1553,15 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     TLLM_CHECK_WITH_INFO(params.size_per_head % 8 == 0, "Head size needs to be multiple of 8!");
     TLLM_CHECK_WITH_INFO(params.rotary_embedding_dim % 8 == 0, "Rotary embedding dimension needs to be multiple of 8!");
 
+// NVFP4 kv cache requires head size to be power of 2.
+#ifdef ENABLE_FP4
+    if (std::is_same_v<TCache, __nv_fp4_e2m1>)
+    {
+        TLLM_CHECK_WITH_INFO((params.size_per_head & (params.size_per_head - 1)) == 0,
+            "Head size needs to be power of 2 for nvfp4 kv cache.");
+    }
+#endif
+
     // TODO: this should be extended to support quantized FP4 outputs as well.
     // For now, we will assume that the attention kernel reads directly from the KV cache
     // and FP16 inputs.
@@ -1847,4 +1880,5 @@ void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

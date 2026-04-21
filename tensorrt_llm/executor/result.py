@@ -1,6 +1,6 @@
 import asyncio
+import dataclasses
 import json
-import threading
 import time
 import weakref
 from dataclasses import dataclass, field
@@ -15,17 +15,18 @@ import torch.nn.functional as F
 from tensorrt_llm.llmapi import tracing
 
 try:
-    import ray
+    pass
 except ModuleNotFoundError:
-    from tensorrt_llm import ray_stub as ray
+    pass
 
-from .._ray_utils import unwrap_ray_errors
-from .._utils import mpi_disabled, nvtx_range_debug
+from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
+from ..metrics.perf_utils import \
+    process_req_perf_metrics as _process_req_perf_metrics
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
 
@@ -160,135 +161,37 @@ class CompletionOutput:
         return self.logprobs[self._last_logprobs_len:]
 
 
-def warmup_tensorrt_llm():
-    import tensorrt_llm
-    print("Warmup by importing tensorrt_llm with version",
-          tensorrt_llm.version.__version__)
-
-
-@ray.remote(max_concurrency=1000000, num_cpus=2)
-class RayAsyncQueue:
-    """Ray actor for async response handling."""
-
-    def __init__(self):
-        self.data = {}
-        self.event_map = {}
-        self.warmup_done = False
-
-    def register(self, key: int):
-        assert key not in self.event_map, f"Key {key} already registered"
-        self.event_map[key] = asyncio.Event()
-
-    def unregister(self, key: int):
-        if key in self.event_map:
-            del self.event_map[key]
-
-        if key in self.data:
-            del self.data[key]
-
-    def warmup(self):
-        if self.warmup_done:
-            return
-        warmup_tensorrt_llm()
-        self.warmup_done = True
-
-    def put_response(self, key: int, item: Any):
-        assert key in self.event_map, f"Key {key} not registered"
-        self.data[key] = item
-        self.event_map[key].set()
-
-    async def get_async(self, key: int):
-        assert key in self.event_map, f"Key {key} not registered"
-        await self.event_map[key].wait()
-        self.event_map[key].clear()
-        ret = self.data[key]
-        del self.data[key]
-        return ret
-
-
-SYNC_QUEUE_MAX_CONCURRENCY = 2
-
-
-@ray.remote(max_concurrency=SYNC_QUEUE_MAX_CONCURRENCY,
-            num_cpus=SYNC_QUEUE_MAX_CONCURRENCY)
-class RaySyncQueue:
-    """Ray actor for sync response handling."""
-
-    def __init__(self):
-        self.data = {}
-        self.event_map = {}
-        self.semaphore = threading.Semaphore(SYNC_QUEUE_MAX_CONCURRENCY - 1)
-        self.warmup_done = False
-
-    def register(self, key: int):
-        assert key not in self.event_map, f"Key {key} already registered"
-        self.event_map[key] = threading.Event()
-        self.event_map[key]
-
-    def unregister(self, key: int):
-        if key in self.event_map:
-            del self.event_map[key]
-
-        if key in self.data:
-            del self.data[key]
-
-    def warmup(self):
-        if self.warmup_done:
-            return
-        warmup_tensorrt_llm()
-        self.warmup_done = True
-
-    def put_response(self, key: int, item: Any):
-        self.data[key] = item
-        self.event_map[key].set()
-
-    def get(self, key: int):
-        with self.semaphore:
-            self.event_map[key].wait()
-            self.event_map[key].clear()
-            ret = self.data[key]
-            del self.data[key]
-            return ret
-
-
 class GenerationResultBase:
     ''' This holds the core logic of the GenerationResult class. '''
 
     def __init__(self,
                  id: int,
                  sampling_params: SamplingParams,
-                 ray_queue: Optional[RayAsyncQueue] = None,
                  background_error_handler: Optional[Callable] = None,
                  postproc_params: "Optional[PostprocParams]" = None):
         self.id = id
         self.sampling_params = sampling_params
         self.postproc_params = postproc_params
-        self.disaggregated_params = None
+        self._disaggregated_params = None
         self.decoding_iter = 0
         self.cached_tokens = 0
         # Average decoded tokens per runtime iteration; set when the first LLM response arrives.
         # None indicates not yet available (e.g., before first step/stream).
         self.avg_decoded_tokens_per_iter: Optional[float] = None
         self._done = False
+        self._aborted = False
         self.metrics_dict = {}
+        self.candidate_metrics: list[dict] = []
         self.trace_headers: Optional[dict[str, str]] = None
+        # torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally
+        self.use_trtllm_sampler = sampling_params.use_beam_search and sampling_params.best_of > 1
 
-        if ray_queue is not None:
-            if has_event_loop():
-                self.aqueue = ray_queue
-                self.queue = self.aqueue
-            else:
-                self.queue = ray_queue
-                self.aqueue = None
-            with unwrap_ray_errors():
-                ray.get(self.queue.register.remote(id))
+        if has_event_loop():
+            self.aqueue = AsyncQueue()
+            self.queue = self.aqueue.sync_q
         else:
-            if has_event_loop():
-                self.aqueue = AsyncQueue()
-                self.queue = self.aqueue.sync_q
-            else:
-                self.queue = Queue()
-                self.aqueue = None
+            self.queue = Queue()
+            self.aqueue = None
 
         # In Sampling mode, the Executor runtime will return best_of sequences
         # in total, which the LLM API will select the n-best sequences among
@@ -297,7 +200,8 @@ class GenerationResultBase:
             CompletionOutput(i) for i in range(self.sampling_params.best_of)
         ]
         self._context_logits: Optional[torch.Tensor] = None
-        self._mm_embedding_handle: Optional[Dict[str, Any]] = None
+        # Request-level time breakdown (PyTorch backend); not on CompletionOutput to avoid API churn.
+        self.time_breakdown_metrics: Optional[Dict] = None
 
         self._background_error_handler = None
         if background_error_handler is not None:
@@ -311,6 +215,22 @@ class GenerationResultBase:
         # request. SamplingParams is necessary for creating dummy
         # GenerationResultBase instances on postprocess worker processes.
         self._params_transmitted = False
+
+    def abort(self) -> None:
+        """Abort the generation request.
+
+        Base implementation sets the aborted flag. Subclasses with executor
+        access (e.g. GenerationResult) override to also cancel on the executor.
+        """
+        self._aborted = True
+
+    def aborted(self) -> bool:
+        """Return whether the generation request is aborted.
+
+        Returns:
+            bool: whether the generation request is aborted.
+        """
+        return self._aborted
 
     @property
     def outputs(self) -> List[CompletionOutput]:
@@ -335,9 +255,9 @@ class GenerationResultBase:
         return self._context_logits
 
     @property
-    # TODO: Keep this property only for backward compatibility. In the future, access multimodal embedding handles from disaggregated_params instead.
-    def mm_embedding_handle(self) -> Optional[Dict[str, Any]]:
-        return self._mm_embedding_handle
+    def disaggregated_params(self) -> Optional[DisaggregatedParams]:
+        """Returns the disaggregated params."""
+        return self._disaggregated_params
 
     def _handle_sequence(self,
                          finish_reasons,
@@ -378,20 +298,44 @@ class GenerationResultBase:
             # each streamed response_tensors.log_probs[src_idx]
             # contains a streamwise monotonically growing list of logprobs.
             # so we need to accumulate only the new ones unique to that particular streamed response
-            assert output._last_logprobs_len <= len(
-                response_tensors.log_probs[src_idx]
-            ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
-                f"{len(response_tensors.log_probs[src_idx])})")
-            output.logprobs += response_tensors.log_probs[src_idx][
-                output._last_logprobs_len:]
+            if self.use_trtllm_sampler:
+                assert output._last_logprobs_len <= len(
+                    response_tensors.log_probs[src_idx]
+                ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
+                    f"{len(response_tensors.log_probs[src_idx])})")
+                output.logprobs += response_tensors.log_probs[src_idx][
+                    output._last_logprobs_len:]
+            else:
+                output.logprobs += response_tensors.log_probs[src_idx]
+
             # overcome some WAR in the cpp executor
             if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
-                # Check if logprobs is a list (not a dict or other structure)
-                if len(output.logprobs) > output.length:
+                if self.use_trtllm_sampler and len(
+                        output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
-                assert len(output.logprobs) == output.length
+
+                is_generation_only = (self.disaggregated_params is not None
+                                      and self.disaggregated_params.request_type
+                                      == "generation_only")
+                if is_generation_only:
+                    assert len(output.logprobs) >= output.length - 1, (
+                        f"logprobs length: {len(output.logprobs)} < "
+                        f"output.length - 1: {output.length - 1}")
+                    if len(output.logprobs) < output.length:
+                        logger.warning(
+                            "Disaggregated serving: the response contains "
+                            "%d logprob entries instead of %d because "
+                            "logprobs for the first generated token were "
+                            "not transferred from the context server. "
+                            "Enable logprobs on both the prefill and "
+                            "decode servers to receive complete results.",
+                            len(output.logprobs), output.length)
+                else:
+                    assert len(output.logprobs) == output.length, (
+                        f"logprobs length: {len(output.logprobs)} != "
+                        f"output.length: {output.length}")
 
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
@@ -414,7 +358,19 @@ class GenerationResultBase:
         if response_tensors.request_perf_metrics is not None:
             output.request_perf_metrics = response_tensors.request_perf_metrics
 
-        if self._done:
+        # Request-level time breakdown (e.g. from PyTorch LlmResult); kept on result, not CompletionOutput.
+        if hasattr(response_tensors, 'time_breakdown_metrics'
+                   ) and response_tensors.time_breakdown_metrics is not None:
+            self.time_breakdown_metrics = response_tensors.time_breakdown_metrics
+
+        # Check if this specific sequence is finished (not just if the entire request is done)
+        # This is important for best_of > n sampling where sequences finish at different times
+        sequence_is_finished = (finish_reasons and finish_reasons[src_idx]
+                                != tllm.FinishReason.NOT_FINISHED
+                                and finish_reasons[src_idx]
+                                != tllm.FinishReason.CANCELLED) or self._done
+
+        if sequence_is_finished:
             if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
                 output.finish_reason = 'stop'
             elif finish_reasons[src_idx] == tllm.FinishReason.STOP_WORDS:
@@ -439,7 +395,15 @@ class GenerationResultBase:
             else:
                 raise ValueError(
                     f"Unknown finish reason: {finish_reasons[src_idx]}")
-            self.record_stats(output, req_perf_metrics_dict)
+
+        # Record per-candidate metrics as each sequence finishes so that
+        # GENERATION_TOKENS and TPOT are captured for every candidate when
+        # sampling_params.n > 1.
+        if sequence_is_finished:
+            self.record_stats(output, req_perf_metrics_dict, seq_idx)
+
+        # Tracing is recorded once when the entire request is done.
+        if self._done:
             self.do_tracing(output, req_perf_metrics_dict)
 
     @print_traceback_on_error
@@ -479,6 +443,9 @@ class GenerationResultBase:
             if response.metrics:
                 self.metrics_dict.update(response.metrics)
 
+            if response.should_abort and not self._aborted:
+                self.abort()
+
             if response.error:
                 if self._background_error_handler is not None and (
                         handler := self._background_error_handler()):
@@ -500,12 +467,21 @@ class GenerationResultBase:
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
             if context_phase_params is not None:
-                self.disaggregated_params = DisaggregatedParams(
+                existing_disagg_params = self.disaggregated_params
+                # Use `replace` to preserve things like `mrope_position_ids_handle` and
+                # `mrope_position_deltas_handle`. However, explicitly set
+                # `multimodal_embedding_handles=None` since they should no longer be needed.
+                self._disaggregated_params = dataclasses.replace(
+                    existing_disagg_params or DisaggregatedParams(),
                     request_type="context_only",
                     first_gen_tokens=context_phase_params.first_gen_tokens,
                     ctx_request_id=context_phase_params.req_id,
                     opaque_state=context_phase_params.opaque_state,
-                    draft_tokens=context_phase_params.draft_tokens)
+                    draft_tokens=context_phase_params.draft_tokens,
+                    ctx_dp_rank=context_phase_params.ctx_dp_rank,
+                    ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
+                    multimodal_embedding_handles=None,
+                )
 
             finish_reasons = response_result.finish_reasons
             # output_token_ids = (beams, tokens)
@@ -519,49 +495,79 @@ class GenerationResultBase:
                                       response_result.sequence_index,
                                       logprobs_result, req_perf_metrics_dict)
 
+            # For context_only responses, carry the first gen token's
+            # logprobs and generation logits so the generation_only side
+            # can prepend them.
+            if (context_phase_params is not None
+                    and self._disaggregated_params is not None):
+                first_gen_lp = [
+                    out.logprobs[0] for out in self._outputs if out.logprobs
+                ]
+                if first_gen_lp:
+                    self._disaggregated_params.first_gen_log_probs = \
+                        first_gen_lp
+
+                first_gen_logits = [
+                    out.generation_logits for out in self._outputs
+                    if out.generation_logits is not None
+                ]
+                if first_gen_logits:
+                    self._disaggregated_params.first_gen_logits = \
+                        first_gen_logits
+
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
 
-            if hasattr(response_result, 'mm_embedding_handle'
-                       ) and response_result.mm_embedding_handle is not None:
-                self._mm_embedding_handle = response_result.mm_embedding_handle
-                if self.disaggregated_params is not None:
-                    self.disaggregated_params.multimodal_embedding_handles = [
-                        response_result.mm_embedding_handle
-                    ],
-                    self.disaggregated_params.multimodal_hashes = self._multimodal_hashes
+            if hasattr(response_result, "mm_embedding_handles"
+                       ) and response_result.mm_embedding_handles is not None:
+                # mm_embedding_handles is a list of handles (one per multimodal item).
+                mm_embedding_handles = response_result.mm_embedding_handles
+                if self._disaggregated_params is not None:
+                    self._disaggregated_params.multimodal_embedding_handles = mm_embedding_handles
+                    self._disaggregated_params.multimodal_hashes = self._multimodal_hashes
                 else:
-                    self.disaggregated_params = DisaggregatedParams(
-                        multimodal_embedding_handles=[
-                            response_result.mm_embedding_handle
-                        ],
+                    self._disaggregated_params = DisaggregatedParams(
+                        multimodal_embedding_handles=mm_embedding_handles,
                         multimodal_hashes=self._multimodal_hashes)
+
+            # Handle mrope handles for both:
+            # 1. Regular mm_embedding case (disaggregated_params was just created/updated above)
+            # 2. Prefill-only EPD requests (mm_embedding_handle is None because embeddings
+            #    were already computed in encode phase, but mrope still needs forwarding)
+            if (getattr(response_result, "mrope_position_ids_handle", None)
+                    is not None and self.disaggregated_params is not None):
+                self._disaggregated_params.mrope_position_ids_handle = (
+                    response_result.mrope_position_ids_handle)
+                self._disaggregated_params.mrope_position_deltas_handle = (
+                    response_result.mrope_position_deltas_handle)
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
                     handler := self._background_error_handler()):
                 handler()
         elif isinstance(response, ErrorResponse):
+            self._done = True
             if self._background_error_handler is not None and (
                     handler := self._background_error_handler()):
                 handler(response.error_msg)
         else:
             raise ValueError(f"Unknown response type: {response}")
 
-        if self._done and mpi_disabled():
-            assert hasattr(
-                self.queue, "unregister"
-            ), "Ray path should be activated for unregistering the Ray queue."
-            self.queue.unregister.remote(self.id)
-
     def record_stats(self,
                      output: CompletionOutput,
-                     stats: Optional[dict[str, float]] = None) -> None:
+                     stats: Optional[dict[str, float]] = None,
+                     sequence_index: int = 0) -> None:
         """Record the stats of the generation result.
+
+        Called once per candidate when it finishes.  When ``n > 1`` each
+        candidate has its own timestamps so TPOT and GENERATION_TOKENS are
+        computed independently per candidate.  PROMPT_TOKENS are only recorded
+        for ``sequence_index == 0`` to avoid double-counting the shared prompt.
 
         Args:
             output (CompletionOutput): The output of the generation result.
             stats (Optional[dict[str, float]]): The stats of the generation result. Defaults to None.
+            sequence_index (int): Index of this candidate (0 for the first / only sequence). Defaults to 0.
         """
         if not stats:
             return
@@ -572,9 +578,16 @@ class GenerationResultBase:
                 output.finish_reason
             })
         processed_metrics_stat = _process_req_perf_metrics(
-            stats, len(output.token_ids), self.sampling_params.n > 1)
+            stats, len(output.token_ids))
         if processed_metrics_stat:
             metrics_stats.update(processed_metrics_stat)
+        # Record prompt tokens only for the first candidate to avoid
+        # double-counting the shared prompt across n candidates.
+        if output.finish_reason and sequence_index == 0:
+            prompt_token_ids = getattr(self, "prompt_token_ids", None)
+            if prompt_token_ids is not None and len(prompt_token_ids) > 0:
+                metrics_stats[MetricNames.PROMPT_TOKENS] = len(prompt_token_ids)
+        self.candidate_metrics.append(metrics_stats)
         self.metrics_dict.update(metrics_stats)
 
     def do_tracing(
@@ -752,7 +765,6 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
 
                             beam_output.finish_reason = 'stop'
                             beam_output.stop_reason = stop_reason
-                            self.abort()
                             self._done = True
                             break
 
@@ -779,21 +791,15 @@ class GenerationResult(GenerationResultBase):
         disaggregated_params: Optional[DisaggregatedParams] = None,
         logprob_params: Optional[LogprobParams] = None,
     ) -> None:
-        use_async_queue = has_event_loop()
-        shared_queue = None
-        if executor and executor.use_ray_queue():
-            shared_queue = executor.async_response_queue_weakref if use_async_queue else executor.sync_response_queue_weakref
-
         super().__init__(
             generation_request.id,
             generation_request.sampling_params,
-            shared_queue,
             background_error_handler,
             postproc_params=generation_request.postproc_params,
         )
         self._generation_request = generation_request
         self._streaming = generation_request.streaming
-        self.disaggregated_params = disaggregated_params
+        self._disaggregated_params = disaggregated_params
         # minimal sampling params needed for logprob calculation
         self._logprob_params = logprob_params
         self.trace_headers = generation_request.trace_headers
@@ -801,7 +807,6 @@ class GenerationResult(GenerationResultBase):
         # for aborting the request
         self._executor: Optional[weakref.ReferenceType[
             "GenerationExecutor"]] = weakref.ref(executor) if executor else None
-        self._aborted = False
 
         # Pipelined multimodal hashes from request to result
         mm_hashes = getattr(
@@ -822,15 +827,7 @@ class GenerationResult(GenerationResultBase):
         """
         assert self._executor is not None, "The executor is not set for this result."
         self._executor().abort_request(self.request_id)
-        self._aborted = True
-
-    def aborted(self) -> bool:
-        """Return whether the generation request is aborted.
-
-        Returns:
-            bool: whether the generation request is aborted.
-        """
-        return self._aborted
+        super().abort()
 
     @property
     def finished(self) -> bool:
@@ -846,22 +843,12 @@ class GenerationResult(GenerationResultBase):
         return response
 
     def _result_step(self, timeout: Optional[float] = None):
-        if mpi_disabled():
-            with unwrap_ray_errors():
-                response = ray.get(self.queue.get.remote(self.request_id))
-            response = self._handle_ray_response(response)
-        else:
-            response = self.queue.get()
-
+        response = self.queue.get()
         self._handle_response(response)
 
     async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
-        if mpi_disabled():
-            response = await self.aqueue.get_async.remote(self.request_id)
-            response = self._handle_ray_response(response)
-        else:
-            response = await self.aqueue.get()
+        response = await self.aqueue.get()
         global_tracer().log_instant("result_step.get")
         self._handle_response(response)
 
@@ -919,8 +906,12 @@ class GenerationResult(GenerationResultBase):
 
     def _repr_fields(self):
         return [
-            'request_id', 'prompt_token_ids', 'outputs', 'finished',
-            "context_logits", "mm_embedding_handle"
+            'request_id',
+            'prompt_token_ids',
+            'outputs',
+            'finished',
+            "context_logits",
+            "disaggregated_params",
         ]
 
     def __repr__(self) -> str:
@@ -998,6 +989,7 @@ def compute_logprobs(
     context_logits: Optional[torch.Tensor],
     generation_logits: Optional[torch.Tensor],
     output_token_ids: Optional[list[int]],
+    prompt_token_ids: Optional[list[int]] = None,
 ) -> LogProbsResult:
     """
     Compute top-K logprobs from logits when engine doesn't provide them directly.
@@ -1025,6 +1017,21 @@ def compute_logprobs(
             logits = logits[:len(tokens)]
 
         logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
+
+        # only return sampled token
+        if top_k == 0:
+            results: TokenLogprobs = []
+            if tokens is not None:
+                for t in range(logprobs.size(0)):
+                    token_id = tokens[t]
+                    token_logprob = logprobs[t, token_id].item()
+                    rank = (logprobs[t] > token_logprob).sum().item() + 1
+                    token_dict = {
+                        token_id: Logprob(logprob=token_logprob, rank=rank)
+                    }
+                    results.append(token_dict)
+            return results
+
         topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)
 
         results: TokenLogprobs = []
@@ -1049,38 +1056,11 @@ def compute_logprobs(
         return results
 
     prompt_logprobs = _topk_logprobs(
-        context_logits, k_prompt_logprobs,
-        None) if k_prompt_logprobs and context_logits is not None else None
+        context_logits, k_prompt_logprobs, prompt_token_ids
+    ) if k_prompt_logprobs is not None and context_logits is not None else None
     generation_logprobs = _topk_logprobs(
         generation_logits, k_logprobs, output_token_ids
-    ) if k_logprobs and generation_logits is not None else None
+    ) if k_logprobs is not None and generation_logits is not None else None
 
     return LogProbsResult(prompt=prompt_logprobs,
                           generation=generation_logprobs)
-
-
-def _process_req_perf_metrics(
-        req_perf_metrics_dict: Optional[dict[str, float]],
-        output_length: int,
-        is_multiple_response: bool = False) -> dict[MetricNames, float]:
-    stat = {}
-    if not req_perf_metrics_dict:
-        return stat
-    ttft = req_perf_metrics_dict.get(RequestEventTiming.FIRST_TOKEN_TIME, 0) - \
-           req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    e2e = req_perf_metrics_dict.get(RequestEventTiming.LAST_TOKEN_TIME, 0) - \
-          req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    request_queue_time = req_perf_metrics_dict.get(RequestEventTiming.FIRST_SCHEDULED_TIME, 0) - \
-                         req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
-    stat = {
-        MetricNames.TTFT: ttft,
-        MetricNames.E2E: e2e,
-        MetricNames.REQUEST_QUEUE_TIME: request_queue_time
-    }
-    if output_length > 1 and not is_multiple_response:
-        tpot = (req_perf_metrics_dict.get(
-            RequestEventTiming.LAST_TOKEN_TIME, 0) - req_perf_metrics_dict.get(
-                RequestEventTiming.FIRST_TOKEN_TIME, 0)) / (output_length - 1)
-        stat.update({MetricNames.TPOT: tpot})
-    stat = dict(filter(lambda item: item[1] > 0, stat.items()))
-    return stat

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,8 +14,10 @@
 # limitations under the License.
 # -*- coding: utf-8 -*-
 """
-Model pytorch yaml config for trtllm-bench perf tests
+Model pytorch/TRT yaml config for trtllm-bench perf tests
 """
+
+from ..conftest import llm_models_root
 
 
 def recursive_update(d, u):
@@ -36,12 +38,18 @@ def get_model_yaml_config(model_label: str,
         Returns:
             dict: yaml config
         """
-    base_config = {
-        'print_iter_log': True,
-        'cuda_graph_config': {
-            'enable_padding': True,
-        },
-    }
+    if 'pytorch' in model_label:
+        # Pytorch backend config
+        base_config = {
+            'print_iter_log': True,
+            'cuda_graph_config': {
+                'enable_padding': True,
+            },
+        }
+    else:
+        # TRT backend config
+        base_config = {}
+
     if 'kv_cache_dtype' in model_label:
         base_config.update({
             'kv_cache_dtype':
@@ -53,7 +61,7 @@ def get_model_yaml_config(model_label: str,
     pattern_configs = [
         # Deepseek default cases
         {
-            'patterns': 'deepseek_r1',
+            'patterns': ['deepseek_r1', 'kimi_k2_nvfp4'],
             'config': {
                 'enable_attention_dp': True,
             }
@@ -71,6 +79,34 @@ def get_model_yaml_config(model_label: str,
                     'decoding_type': 'MTP',
                     'num_nextn_predict_layers': 3
                 }
+            }
+        },
+        {
+            'patterns': [
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:32768-input_output_len:8192,1024-reqs:20-con:1-ep:1-gpus:4'
+            ],
+            'config': {
+                'enable_iter_perf_stats': True,
+                'print_iter_log': False,
+                'cuda_graph_config': {
+                    'max_batch_size': 16,
+                    'enable_padding': False
+                },
+                'moe_config': {
+                    'max_num_tokens': 32768
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'num_nextn_predict_layers': 3
+                },
+                'disable_overlap_scheduler': True,
+                'enable_autotuner': True,
+                'kv_cache_config': {
+                    'free_gpu_memory_fraction': 0.6,
+                    'enable_block_reuse': True,
+                    'enable_partial_reuse': False
+                },
+                'enable_chunked_prefill': True
             }
         },
         # DeepSeek R1 models with large batch sizes and cuda graph padding
@@ -113,6 +149,49 @@ def get_model_yaml_config(model_label: str,
                 'enable_chunked_prefill': True,
             }
         },
+        # Deepseek R1 NVFP4 with chunked prefill, large seq len, and fp8 KV cache
+        {
+            'patterns': [
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:4096-kv_frac:0.80-input_output_len:8192,512-reqs:3000-ep:2-tp:4-gpus:4',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'enable_chunked_prefill': True,
+                'max_num_tokens': 4096,
+                'max_batch_size': 32,
+                'max_seq_len': 81920,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'free_gpu_memory_fraction': 0.80,
+                    'enable_block_reuse': False,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 32,
+                },
+            }
+        },
+        # Deepseek R1 model with CUTLASS backend
+        {
+            'patterns': [
+                'deepseek_r1_nvfp4-bench-pytorch-streaming-float4-maxbs:512-maxnt:5220-input_output_len:4000,2000',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                    'max_num_tokens': 3072,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'free_gpu_memory_fraction': 0.5,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 32, 64],
+                },
+            }
+        },
         # Deepseek_v3_lite_cases
         {
             'patterns':
@@ -125,9 +204,10 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
-        # Llama Nemotron models with attention_dp disabled to prevent hangs
+        # Model-specific cases with attention_dp disabled to prevent hangs
         {
             'patterns': [
+                'deepseek_r1_distill_llama_70b',
                 'llama_v3.1_nemotron_ultra_253b_fp8-bench-pytorch-float8',
                 'llama_v3.3_nemotron_super_49b_fp8-bench-pytorch-float8',
                 'llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16'
@@ -147,16 +227,44 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
-        # Qwen3 models with fp4 quantization on B200 with moe backend equal to TRTLLM
         {
             'patterns': [
-                'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:8-ep:8-gpus:8',
+                'qwen3_4b-bench-pytorch-streaming-bfloat16-maxbs:4-kv_frac:0.6-input_output_len:500,100-reqs:200-con:4',
+            ],
+            'config': {
+                'speculative_config': {
+                    'decoding_type': 'Eagle',
+                    'eagle3_one_model': True,
+                    'speculative_model': 'Qwen3-4B_eagle3',
+                    'max_draft_len': 3,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+                'enable_chunked_prefill': False,
+            }
+        },
+        # Qwen3-235B-A22B-FP4 with Eagle3 speculative decoding
+        {
+            'patterns': [
+                'qwen3_235b_a22b_fp4_eagle3-bench-pytorch',
             ],
             'config': {
                 'enable_attention_dp': False,
-                'moe_config': {
-                    'backend': 'TRTLLM'
-                }
+                'disable_overlap_scheduler': False,
+                'enable_autotuner': False,
+                'enable_chunked_prefill': False,
+                'speculative_config': {
+                    'decoding_type':
+                    'Eagle',
+                    'max_draft_len':
+                    3,
+                    'speculative_model_dir':
+                    f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3",
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
             }
         },
         # Llama-v3.3 models with fp8 quantization
@@ -196,9 +304,6 @@ def get_model_yaml_config(model_label: str,
                     'enable_padding': True,
                     'max_batch_size': 720,
                 },
-                'moe_config': {
-                    'backend': 'CUTLASS'
-                },
                 'stream_interval': 10,
                 'num_postprocess_workers': 4
             }
@@ -215,11 +320,59 @@ def get_model_yaml_config(model_label: str,
                     'enable_padding': True,
                     'max_batch_size': 720,
                 },
-                'moe_config': {
-                    'backend': 'TRTLLM'
-                },
                 'stream_interval': 10,
                 'num_postprocess_workers': 4
+            }
+        },
+        # GPT-OSS 120B speculative decoding with Eagle3
+        {
+            'patterns': [
+                'gpt_oss_120b_eagle3-bench-pytorch',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'disable_overlap_scheduler': False,
+                'enable_autotuner': False,
+                'enable_chunked_prefill': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                },
+                'speculative_config': {
+                    'decoding_type':
+                    'Eagle',
+                    'max_draft_len':
+                    3,
+                    'speculative_model_dir':
+                    f'{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3',
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+            }
+        },
+        # GPT-OSS 120B speculative decoding with Eagle3-throughput (https://nvbugspro.nvidia.com/bug/5832481)
+        {
+            'patterns': [
+                'gpt_oss_120b_eagle3_throughput-bench-pytorch',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'disable_overlap_scheduler': True,
+                'enable_autotuner': False,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                },
+                'speculative_config': {
+                    'decoding_type':
+                    'Eagle',
+                    'max_draft_len':
+                    3,
+                    'speculative_model_dir':
+                    f'{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3-throughput',
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
             }
         },
         # Phi-4-multimodal-instruct with chunked prefill and kv_cache_reuse
@@ -241,7 +394,78 @@ def get_model_yaml_config(model_label: str,
             'config': {
                 'enable_chunked_prefill': True,
             }
-        }
+        },
+        # Llama-v3.3 models with xgrammar guided decoding
+        {
+            'patterns': [
+                "llama_v3.3_70b_instruct_fp8-bench-float8-maxbs:512-maxnt:2048-input_output_len:500,2000-reqs:400-con:200-gpus:8-extra"
+            ],
+            'config': {
+                'extended_runtime_perf_knob_config': {
+                    'cuda_graph_cache_size': 1.0,
+                    'cuda_graph_mode': True,
+                },
+                'guided_decoding_backend': 'xgrammar'
+            }
+        },
+        # Gemma3 models require FlashInfer backend due to sliding window attention
+        {
+            'patterns': ['gemma_3', 'gemma3'],
+            'config': {
+                'attn_backend': 'FLASHINFER',
+            }
+        },
+        # Nemotron-3-Super-120B-NVFP4: (no MTP)
+        {
+            'patterns': ['nemotron_3_super_120b_nvfp4-'],
+            'config': {
+                'max_seq_len': 1048576,
+                'enable_chunked_prefill': True,
+                'enable_attention_dp': False,
+                'stream_interval': 1,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 8,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
+                },
+            }
+        },
+        # Nemotron-3-Super-120B-NVFP4: MTP speculative decoding
+        {
+            'patterns': ['nemotron_3_super_120b_nvfp4_mtp'],
+            'config': {
+                'max_seq_len': 1048576,
+                'enable_chunked_prefill': True,
+                'enable_attention_dp': False,
+                'stream_interval': 1,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 8,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'num_nextn_predict_layers': 3,
+                    'allow_advanced_sampling': True,
+                },
+            }
+        },
     ]
 
     # Apply pattern-based configurations on top of base config
@@ -251,7 +475,8 @@ def get_model_yaml_config(model_label: str,
             patterns = [patterns]
         for pattern in patterns:
             if pattern in model_label.lower():
-                recursive_update(base_config, pattern_config['config'])
+                if pattern_config.get('config'):
+                    recursive_update(base_config, pattern_config['config'])
                 break  # Stop checking other patterns for this config once we find a match
 
     # lora-specific change for pytorch

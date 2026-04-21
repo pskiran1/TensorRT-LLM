@@ -14,24 +14,75 @@
 # limitations under the License.
 # # Force resource release after test
 import os
+import signal
 import sys
 import traceback
+import warnings
 from functools import partial
-from typing import Any
+from typing import Any, Generator
+
+try:
+    import ray
+except ModuleNotFoundError:
+    from tensorrt_llm import ray_stub as ray
 
 import _pytest.outcomes
 import pytest
 import torch
 import tqdm
 from mpi4py.futures import MPIPoolExecutor
+from utils.cpp_paths import llm_root  # noqa: F401
+from utils.util import get_current_process_gpu_memory
+
+from tensorrt_llm._utils import print_all_stacks
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
 
 
+def dump_threads(signum, frame):
+    print_all_stacks()
+
+
 def pytest_configure(config):
+    os.environ.setdefault("TRTLLM_NO_USAGE_STATS", "1")
+
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
+
+    # Dump all threads' stacks when SIGALRM is received
+    signal.signal(signal.SIGALRM, dump_threads)
+
+    # Register PeriodicJUnitXML when invoked from integration test_unittests.py
+    periodic = config.getoption("--periodic-junit", default=False)
+    periodic_junit_xmlpath = config.getoption("--periodic-junit-xmlpath",
+                                              default=None)
+    if periodic and periodic_junit_xmlpath:
+        from integration.defs.trt_test_alternative import (print_info,
+                                                           print_warning)
+        from integration.defs.utils.periodic_junit import PeriodicJUnitXML
+        periodic_interval = config.getoption("--periodic-interval")
+        periodic_batch_size = config.getoption("--periodic-batch-size")
+        periodic_save_unfinished_test = config.getoption(
+            "--periodic-save-unfinished-test", default=False)
+        xml_dir = os.path.dirname(periodic_junit_xmlpath)
+        if xml_dir:
+            os.makedirs(xml_dir, exist_ok=True)
+        reporter = PeriodicJUnitXML(
+            xmlpath=periodic_junit_xmlpath,
+            interval=periodic_interval,
+            batch_size=periodic_batch_size,
+            logger={
+                'info': print_info,
+                'warning': print_warning
+            },
+            save_unfinished_test=periodic_save_unfinished_test,
+        )
+        reporter.pytest_configure(config)
+        config.pluginmanager.register(reporter, 'periodic_junit')
+        print_info("PeriodicJUnitXML reporter registered (unittest)")
+        print_info(f"  XML path: {periodic_junit_xmlpath}")
+        print_info(f"  Batch size: {periodic_batch_size}")
 
 
 @pytest.hookimpl(wrapper=True)
@@ -99,6 +150,45 @@ def pytest_addoption(parser):
         help=
         "Specify a file containing a list of waives, one per line. After filtering collected tests, Pytest will "
         "apply the waive state specified by this file to the set of tests to be run.",
+    )
+    # Periodic JUnit options: must be registered here so they are recognized when
+    # pytest is run with unittest paths (integration test_unittests.py spawns such a run).
+    parser.addoption(
+        "--periodic-junit",
+        action="store_true",
+        default=False,
+        help=
+        "Enable periodic JUnit XML reporter. Only used when invoked from integration test_unittests.",
+    )
+    parser.addoption(
+        "--periodic-interval",
+        action="store",
+        type=int,
+        default=18000,
+        help=
+        "Time interval in seconds between periodic saves. Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-batch-size",
+        action="store",
+        type=int,
+        default=10,
+        help=
+        "Number of completed tests before triggering a periodic save. Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-junit-xmlpath",
+        action="store",
+        default=None,
+        help=
+        "Path to the output XML file for periodic JUnit XML reporter. Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-save-unfinished-test",
+        action="store_true",
+        default=False,
+        help=
+        "Save unfinished test name to unfinished_test.txt. Only used with --periodic-junit.",
     )
 
 
@@ -316,3 +406,55 @@ def _maybe_force_ray(request, monkeypatch, ray_mode):
                             raising=False)
     except Exception:
         pass
+
+
+@pytest.fixture(scope="module")
+def process_gpu_memory_info_available():
+    """
+    Checks if NVML can get per-process memory information.
+    """
+
+    # Allocate a small tensor to test memory tracking
+    tensor = torch.zeros(4096, dtype=torch.int32, device='cuda')
+    torch.cuda.synchronize()
+
+    # Try to get memory usage
+    usage = get_current_process_gpu_memory()
+
+    # Clean up
+    del tensor
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+    if usage == 0:
+        warnings.warn("Per process memory information unavailable.")
+        return False
+
+    return True
+
+
+@pytest.fixture(scope="function")
+def setup_ray_cluster() -> Generator[int, None, None]:
+    import time
+
+    runtime_env = {
+        "env_vars": {
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
+        }
+    }
+    ray_init_args = {
+        "include_dashboard": False,
+        "namespace": "test",
+        "ignore_reinit_error": True,
+        "runtime_env": runtime_env
+    }
+    try:
+        ray.init(address="local", **ray_init_args)
+        gcs_addr = ray.get_runtime_context().gcs_address
+        port = int(gcs_addr.split(":")[1])
+        # Allow raylet to complete GCS registration before tests create actors.
+        time.sleep(2)
+        yield port
+    finally:
+        if ray.is_initialized():
+            ray.shutdown()

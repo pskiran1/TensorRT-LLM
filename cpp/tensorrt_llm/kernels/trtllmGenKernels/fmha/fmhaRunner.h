@@ -20,10 +20,11 @@
 
 #include "fmhaKernels.h"
 #include "fmhaRunnerParams.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -55,8 +56,9 @@ private:
     // The total device memory.
     size_t mTotalDeviceMemory;
     // The class that stores all the kernels.
-    TllmGenFmhaKernel const* mKernel;
+    TllmGenFmhaKernel* mKernel;
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

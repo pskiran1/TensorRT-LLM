@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,14 +22,15 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from .. import profiler
-from .._utils import mpi_broadcast
-from ..bindings import (DataType, GptJsonConfig, KVCacheType, ModelConfig,
-                        WorldConfig)
+from .._deprecation import emit_engine_arch_deprecation
+from .._utils import maybe_pin_memory, mpi_broadcast
+from ..bindings import DataType, GptJsonConfig, ModelConfig, WorldConfig
 from ..bindings import executor as trtllm
 from ..bindings.executor import (DecodingMode, ExternalDraftTokensConfig,
                                  OrchestratorConfig, ParallelConfig)
 from ..builder import EngineConfig
 from ..layers import MropeParams
+from ..llmapi.kv_cache_type import KVCacheType
 from ..logger import logger
 from ..mapping import Mapping
 from .generation import LogitsProcessor, LoraManager
@@ -75,6 +76,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                  world_config: WorldConfig,
                  use_kv_cache: bool,
                  lora_manager: Optional[LoraManager] = None) -> None:
+        emit_engine_arch_deprecation("ModelRunnerCpp")
         self.session = executor
         self.max_batch_size = max_batch_size
         self.max_input_len = max_input_len
@@ -126,6 +128,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         use_variable_beam_width_search: bool = False,
         mm_embedding_offloading: bool = False,
         fail_fast_on_attention_window_too_large: bool = False,
+        normalize_log_probs: bool = False,
     ) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
@@ -248,7 +251,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             json_config = GptJsonConfig.parse_file(config_path)
             model_config = json_config.model_config
 
-        use_kv_cache = model_config.kv_cache_type != KVCacheType.DISABLED
+        use_kv_cache = KVCacheType.from_cpp(
+            model_config.kv_cache_type) != KVCacheType.DISABLED
         if not model_config.use_cross_attention:
             assert cross_kv_cache_fraction is None, "cross_kv_cache_fraction should only be used with enc-dec models."
 
@@ -401,6 +405,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             use_gpu_direct_storage=use_gpu_direct_storage,
             gpu_weights_percent=gpu_weights_percent,
             gather_generation_logits=gather_generation_logits,
+            normalize_log_probs=normalize_log_probs,
         )
         trtllm_config.enable_chunked_context = enable_chunked_context
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
@@ -853,8 +858,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 # CUDA Stream Overlapping Requirements:
                 # 1. Both memory copy stream and kernel execution stream must be non-default streams
                 # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
-                prompt_table_data = self._prepare_embedding_table(
-                    prompt_table).pin_memory()
+                # NOTE: pinning is skipped under Confidential Compute
+                # (see maybe_pin_memory() and prefer_pinned())
+                prompt_table_data = maybe_pin_memory(
+                    self._prepare_embedding_table(prompt_table))
             else:
                 prompt_table_data = self._prepare_embedding_table(
                     prompt_table).cuda()

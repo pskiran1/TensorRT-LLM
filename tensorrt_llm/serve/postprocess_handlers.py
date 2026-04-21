@@ -1,15 +1,22 @@
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Any, List, Literal, Optional, Tuple, Union
+
+from tensorrt_llm.serve.responses_utils import ResponsesStreamingProcessor
+from tensorrt_llm.serve.responses_utils import \
+    create_response_non_store as responses_api_create_response_non_store
 
 from .._utils import nvtx_range_debug
 from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
                         GenerationResultBase)
 from ..executor.postproc_worker import PostprocArgs
 from ..executor.result import Logprob, TokenLogprobs
+from ..llmapi import SamplingParams
 from ..llmapi.reasoning_parser import (BaseReasoningParser,
-                                       ReasoningParserFactory)
+                                       ReasoningParserFactory,
+                                       ReasoningParserResult)
 from ..llmapi.tokenizer import TransformersTokenizer
 # yapf: disable
+from .chat_utils import make_tool_call_id
 from .harmony_adapter import (handle_non_streaming_response,
                               handle_streaming_response)
 from .openai_protocol import (ChatCompletionLogProbs,
@@ -20,12 +27,17 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               ChatCompletionResponseStreamChoice,
                               ChatCompletionStreamResponse,
                               ChatCompletionToolsParam, ChatMessage,
-                              CompletionRequest, CompletionResponse,
-                              CompletionResponseChoice,
+                              CompletionLogProbs, CompletionRequest,
+                              CompletionResponse, CompletionResponseChoice,
                               CompletionResponseStreamChoice,
-                              CompletionStreamResponse, DeltaMessage,
-                              FunctionCall, PromptTokensDetails, StreamOptions,
-                              ToolCall, UsageInfo, to_disaggregated_params)
+                              CompletionStreamResponse, DeltaFunctionCall,
+                              DeltaMessage, DeltaToolCall, FunctionCall,
+                              PromptTokensDetails, ResponsesRequest,
+                              ResponsesResponse, StreamOptions, ToolCall,
+                              UsageInfo, to_disaggregated_params)
+from .tool_parser.base_tool_parser import BaseToolParser
+from .tool_parser.core_types import ToolCallItem
+from .tool_parser.tool_parser_factory import ToolParserFactory
 
 # yapf: enable
 
@@ -33,8 +45,8 @@ from .openai_protocol import (ChatCompletionLogProbs,
 @dataclass(kw_only=True)
 class ChatPostprocArgs(PostprocArgs):
     echo: bool = False
-    role: str = None
-    model: str = None
+    role: str
+    model: str
     num_choices: int = 1
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none"],
@@ -44,8 +56,13 @@ class ChatPostprocArgs(PostprocArgs):
     stream_options: Optional[StreamOptions] = None
     last_message_content: Optional[str] = None
     reasoning_parser: Optional[str] = None
+    tool_parser: Optional[str] = None
     reasoning_parser_dict: dict[int, BaseReasoningParser] = field(
         default_factory=dict)
+    tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
+    has_tool_call: dict[int, bool] = field(default_factory=dict)
+    tool_call_id_type: str = "random"
+    chat_template_kwargs: Optional[dict[str, Any]] = None
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -60,6 +77,7 @@ class ChatPostprocArgs(PostprocArgs):
             stream_options=request.stream_options,
             return_logprobs=bool(request.logprobs),
             top_logprobs=bool(request.top_logprobs),
+            chat_template_kwargs=request.chat_template_kwargs,
         )
 
 
@@ -94,14 +112,18 @@ def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
     return chat_logprobs
 
 
-def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
-                           streaming: bool) -> Tuple[str, str]:
+def apply_reasoning_parser(args: ChatPostprocArgs,
+                           output_index: int,
+                           text: str,
+                           streaming: bool,
+                           finished: bool = False) -> Tuple[str, str]:
     reasoning_parser = None
     if args.reasoning_parser is not None:
         if output_index not in args.reasoning_parser_dict:
+            chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
             args.reasoning_parser_dict[
                 output_index] = ReasoningParserFactory.create_reasoning_parser(
-                    args.reasoning_parser)
+                    args.reasoning_parser, chat_template_kwargs)
         reasoning_parser = args.reasoning_parser_dict[output_index]
 
     if reasoning_parser is not None:
@@ -109,11 +131,43 @@ def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
             result = reasoning_parser.parse(text)
         else:
             result = reasoning_parser.parse_delta(text)
+            if finished:
+                finish_result = reasoning_parser.finish()
+                result = ReasoningParserResult(
+                    content=result.content + finish_result.content,
+                    reasoning_content=result.reasoning_content +
+                    finish_result.reasoning_content,
+                )
         content, reasoning_content = result.content, result.reasoning_content
     else:
         content, reasoning_content = text, ""
 
     return content, reasoning_content
+
+
+def apply_tool_parser(args: ChatPostprocArgs, output_index: int, text: str,
+                      streaming: bool) -> Tuple[str, List[ToolCallItem]]:
+    tool_parser = None
+    tools = args.tools
+    if args.tool_parser is not None and tools is not None:
+        if output_index not in args.tool_parser_dict:
+            args.tool_parser_dict[
+                output_index] = ToolParserFactory.create_tool_parser(
+                    args.tool_parser)
+        tool_parser = args.tool_parser_dict[output_index]
+
+    if tool_parser is not None and tools is not None:
+        if not streaming:
+            result = tool_parser.detect_and_parse(text, tools)
+        else:
+            result = tool_parser.parse_streaming_increment(text, tools)
+        normal_text, calls = result.normal_text, result.calls
+        if result.calls:
+            args.has_tool_call[output_index] = True
+    else:
+        normal_text, calls = text, []
+
+    return normal_text, calls
 
 
 @nvtx_range_debug("chat_stream_post_processor")
@@ -171,32 +225,75 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         delta_text = output.text_diff
 
         delta_text, reasoning_delta_text = apply_reasoning_parser(
-            args, i, delta_text, True)
+            args,
+            i,
+            delta_text,
+            True,
+            finished=(output.finish_reason is not None))
 
         if args.tool_choice and type(
                 args.tool_choice) is ChatCompletionNamedToolChoiceParam:
             delta_message = DeltaMessage(tool_calls=[
-                ToolCall(function=FunctionCall(
-                    name=args.tool_choice.function.name, arguments=delta_text))
-            ])
+                DeltaToolCall(
+                    function=DeltaFunctionCall(
+                        name=args.tool_choice.function.name,
+                        arguments=delta_text),
+                    index=i,
+                ),
+            ], )
         else:
-            delta_message = DeltaMessage(content=delta_text,
-                                         reasoning_content=reasoning_delta_text)
+            delta_text, calls = apply_tool_parser(args, i, delta_text, True)
+            tool_calls = []
+            for call_item in calls:
+                # Tool call ID should be generated only once per tool call
+                if call_item.name:
+                    # First chunk: include ID and function name
+                    tool_call_id = make_tool_call_id(
+                        id_type=args.tool_call_id_type,
+                        func_name=call_item.name,
+                        idx=call_item.tool_index)
+                    function_name = call_item.name
+                else:
+                    # Subsequent chunks: null ID and name for argument deltas
+                    tool_call_id = None
+                    function_name = None
+
+                tool_calls.append(
+                    DeltaToolCall(
+                        id=tool_call_id,
+                        index=call_item.tool_index,
+                        function=DeltaFunctionCall(
+                            name=function_name,
+                            arguments=call_item.parameters,
+                        ),
+                    ))
+            if tool_calls or delta_text or reasoning_delta_text or output.finish_reason:
+                delta_message = DeltaMessage(
+                    content=delta_text,
+                    reasoning_content=reasoning_delta_text,
+                    tool_calls=tool_calls if tool_calls else None)
+            else:
+                continue
 
         choice = ChatCompletionResponseStreamChoice(
             index=i,
             delta=delta_message,
-            finish_reason=None,
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
-                                                None))
+                                                None),
+            stop_reason=output.stop_reason,
+        )
         if args.return_logprobs:
             logprobs = output.logprobs_diff
             token_ids = output.token_ids_diff
             choice.logprobs = create_logprobs(token_ids, args.tokenizer,
                                               logprobs, args.top_logprobs)
         if output.finish_reason is not None:
-            choice.finish_reason = output.finish_reason
+            if output.finish_reason == "stop" and args.has_tool_call.get(
+                    i, False):
+                choice.finish_reason = "tool_calls"
+            else:
+                choice.finish_reason = output.finish_reason
             choice.stop_reason = output.stop_reason
             finish_reason_sent[i] = True
         chunk = ChatCompletionStreamResponse(choices=[choice], model=args.model)
@@ -247,21 +344,34 @@ def chat_response_post_processor(
                         name=args.tool_choice.function.name, arguments=text))
                 ])
         else:
+            if text is None:
+                text = ""
+            text, calls = apply_tool_parser(args, output.index, text, False)
+            tool_calls = [
+                ToolCall(function=FunctionCall(name=call.name or "",
+                                               arguments=call.parameters))
+                for call in calls
+            ]
             message = ChatMessage(role=role,
                                   content=text,
-                                  reasoning_content=reasoning_text)
+                                  reasoning_content=reasoning_text,
+                                  tool_calls=tool_calls)
         disaggregated_params = to_disaggregated_params(
             output.disaggregated_params)
         choice = ChatCompletionResponseChoice(
             index=output.index,
             message=message,
-            finish_reason=output.finish_reason,
             stop_reason=output.stop_reason,
             disaggregated_params=disaggregated_params,
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
         )
+        if output.finish_reason == "stop" and args.has_tool_call.get(
+                output.index, False):
+            choice.finish_reason = "tool_calls"
+        else:
+            choice.finish_reason = output.finish_reason
 
         if args.return_logprobs:
             choice.logprobs = create_logprobs(output.token_ids, args.tokenizer,
@@ -299,6 +409,7 @@ class CompletionPostprocArgs(PostprocArgs):
     prompt_idx: int = 0
     detokenize: bool = True
     prompt: Optional[str] = None
+    return_logprobs: bool = False
     stream_options: Optional[StreamOptions] = None
 
     @classmethod
@@ -309,7 +420,41 @@ class CompletionPostprocArgs(PostprocArgs):
             num_choices=request.n if request.n else 1,
             stream_options=request.stream_options,
             detokenize=request.detokenize,
+            return_logprobs=bool(request.logprobs),
         )
+
+
+def create_completion_logprobs(token_ids: List[int],
+                               tokenizer: TransformersTokenizer,
+                               logprobs: List[float] | TokenLogprobs,
+                               initial_offset: int = 0) -> CompletionLogProbs:
+    assert len(token_ids) == len(logprobs), \
+            "token_ids and logprobs have different lengths"
+    text_offset = []
+    token_logprobs = []
+    top_logprobs_list = []
+    tokens = []
+    for token_id, logprob in zip(token_ids, logprobs):
+        if isinstance(logprob, dict):
+            token_logprobs.append(max(logprob[token_id].logprob, -9999.0))
+            top_logprobs_list.append({
+                tokenizer.decode(tid):
+                max(lp.logprob, -9999.0)
+                for tid, lp in logprob.items()
+            })
+        else:
+            token_logprobs.append(max(logprob, -9999.0))
+
+        token = tokenizer.decode(token_id)
+        if len(text_offset) == 0:
+            text_offset.append(initial_offset)
+        else:
+            text_offset.append(text_offset[-1] + len(token))
+        tokens.append(token)
+    return CompletionLogProbs(text_offset=text_offset,
+                              token_logprobs=token_logprobs,
+                              tokens=tokens,
+                              top_logprobs=top_logprobs_list)
 
 
 @nvtx_range_debug("completion_stream_post_processor")
@@ -338,6 +483,12 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
         )
+        if args.return_logprobs:
+            logprobs = output.logprobs_diff
+            token_ids = output.token_ids_diff
+            choice.logprobs = create_completion_logprobs(
+                token_ids, args.tokenizer, logprobs, output._last_text_len)
+
         chunk = CompletionStreamResponse(model=args.model, choices=[choice])
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
@@ -393,6 +544,11 @@ def completion_response_post_processor(
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
         )
+        if args.return_logprobs:
+            logprobs = output.logprobs
+            token_ids = output.token_ids
+            choice.logprobs = create_completion_logprobs(
+                token_ids, args.tokenizer, logprobs)
 
         completion_tokens += output.length
         choices.append(choice)
@@ -415,6 +571,8 @@ class ChatCompletionPostprocArgs(PostprocArgs):
     tool_choice: Optional[Union[Literal["none", "auto"],
                                 ChatCompletionNamedToolChoiceParam]]
     request_id: Optional[int] = None
+    stream_options: Optional[StreamOptions] = None
+    chat_template_kwargs: Optional[dict[str, Any]] = None
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -422,6 +580,8 @@ class ChatCompletionPostprocArgs(PostprocArgs):
             model=request.model,
             tools=request.tools,
             tool_choice=request.tool_choice,
+            stream_options=request.stream_options if request.stream else None,
+            chat_template_kwargs=request.chat_template_kwargs,
         )
 
 
@@ -435,6 +595,7 @@ def chat_harmony_post_processor(
         outputs=rsp.outputs,
         model=args.model,
         num_prompt_tokens=args.num_prompt_tokens,
+        cached_tokens=rsp.cached_tokens,
     )
     return response
 
@@ -442,13 +603,61 @@ def chat_harmony_post_processor(
 @nvtx_range_debug("chat_harmony_streaming_post_processor")
 def chat_harmony_streaming_post_processor(
         rsp: GenerationResult, args: ChatCompletionPostprocArgs) -> List[str]:
+    # Read the request ID directly from rsp.id instead of args.request_id.
+    # Both are the same executor-assigned ID, but args.request_id is set too
+    # late (after generate_async returns) for the postprocess worker path:
+    # the worker receives a copy of args before the ID is assigned, so
+    # args.request_id is always None with num_postprocess_workers > 0.
     response = handle_streaming_response(
         tools=args.tools,
         tool_choice=args.tool_choice,
         result=rsp,
         model=args.model,
-        request_id=args.request_id,
+        request_id=str(rsp.id),
         done=rsp._done,
         num_prompt_tokens=args.num_prompt_tokens,
+        first_iteration=args.first_iteration,
+        stream_options=args.stream_options,
+        cached_tokens=rsp.cached_tokens,
     )
+    args.first_iteration = False
     return response
+
+
+@dataclass(kw_only=True)
+class ResponsesAPIPostprocArgs(PostprocArgs):
+    model: str
+    request: ResponsesRequest
+    sampling_params: SamplingParams
+    use_harmony: bool
+    reasoning_parser: Optional[str] = None
+    tool_parser: Optional[str] = None
+    streaming_processor: Optional[ResponsesStreamingProcessor] = None
+
+
+@nvtx_range_debug("responses_api_post_processor")
+def responses_api_post_processor(
+        rsp: GenerationResult,
+        args: ResponsesAPIPostprocArgs) -> ResponsesResponse:
+    return responses_api_create_response_non_store(
+        generation_result=rsp,
+        request=args.request,
+        sampling_params=args.sampling_params,
+        model_name=args.model,
+        use_harmony=args.use_harmony,
+        reasoning_parser=args.reasoning_parser,
+        tool_parser=args.tool_parser,
+    )
+
+
+@nvtx_range_debug("responses_api_streaming_post_processor")
+def responses_api_streaming_post_processor(
+        rsp: GenerationResult, args: ResponsesAPIPostprocArgs) -> List[str]:
+    if args.streaming_processor is None:
+        raise ValueError(
+            "streaming_processor is required for streaming post-processing")
+    outputs = args.streaming_processor.process_single_output(rsp)
+    if rsp._done:
+        outputs.append(
+            args.streaming_processor.get_final_response_non_store(rsp))
+    return outputs

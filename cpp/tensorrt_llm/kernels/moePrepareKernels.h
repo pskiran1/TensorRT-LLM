@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <map>
 
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -23,7 +24,9 @@
 
 #define DEBUG_PIPELINE 0
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 namespace moe_prepare
@@ -80,11 +83,13 @@ void moveIndice(int* sendCountsCumsum, int* recvCountsCumsum, int* sendIndice, i
     int* backwardIndice, int* gatherBackwardIndice, int* recvIndice, int* gatherRecvIndice, int rankId, int rankCount,
     int maxTokenCountPerRank, cudaStream_t stream);
 
-void memsetExpertIds(int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int slotCount,
+void memsetExpertIds(int* expertIds, int* recvCountsCumsum, int maxTokenCountPerRank, int topK, int invalidExpertId,
     int epSize, cudaStream_t stream);
 
 size_t getMoePrepareWorkspaceSize(int epSize);
 
 } // namespace moe_prepare
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

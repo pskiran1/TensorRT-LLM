@@ -1,11 +1,17 @@
 # Medusa Decoding
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document shows how to build and run a model using Medusa decoding([`Github`](https://github.com/FasterDecoding/Medusa), [`BLOG`](https://sites.google.com/view/medusa-llm)) in TensorRT LLM on single GPU, single node multiple GPU.
 
 ## Overview
 Different from other models, Medusa decoding needs a base model and Medusa heads. The TensorRT LLM Medusa Decoding implementation can be found in [tensorrt_llm/models/medusa/model.py](../../tensorrt_llm/models/medusa/model.py). The implementation adds Medusa heads to a base model.
 
-For more info about Medusa visit [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/advanced/speculative-decoding.html).
+For more info about Medusa visit [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/features/speculative-decoding.html).
 
 ## Support Matrix
   * GPU Compute Capability >= 8.0 (Ampere or newer)
@@ -19,7 +25,7 @@ For more info about Medusa visit [speculative decoding documentation](https://nv
 The TensorRT LLM Medusa example code is located in [`examples/medusa`](./). There is one [`convert_checkpoint.py`](./convert_checkpoint.py) file to convert and build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run models with Medusa decoding support.
 In this example, we demonstrate the usage of two models:
 1. The Vucuna 7B model from Hugging Face [`FasterDecoding/medusa-vicuna-7b-v1.3`](https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3) with its Medusa heads [`medusa-vicuna-7b-v1.3`](https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3).
-2. The quantized checkpoint [`nvidia/Llama-3.1-8B-Medusa-FP8`](https://huggingface.co/nvidia/Llama-3.1-8B-Medusa-FP8) on Hugging Face by [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) (ModelOpt). This model is based on [Llama-3.1 8B](https://huggingface.co/meta-llama/Llama-3.1-8B) and enhanced with Medusa heads, with both the base model (except lm_head) and Medusa heads already quantized in FP8.
+2. The quantized checkpoint [`nvidia/Llama-3.1-8B-Medusa-FP8`](https://huggingface.co/nvidia/Llama-3.1-8B-Medusa-FP8) on Hugging Face by [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) (ModelOpt). This model is based on [Llama-3.1 8B](https://huggingface.co/meta-llama/Llama-3.1-8B) and enhanced with Medusa heads, with both the base model (except lm_head) and Medusa heads already quantized in FP8.
 
 ### Build TensorRT engine(s)
 Get the weights by downloading base model [`vicuna-7b-v1.3`](https://huggingface.co/lmsys/vicuna-7b-v1.3) and Medusa Heads [`medusa-vicuna-7b-v1.3`](https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3) from HF.

@@ -27,6 +27,20 @@ namespace kvc = tensorrt_llm::executor::kv_cache;
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+/// @brief Statistics for block transfers. Returned by KVCacheTransferManager::getAndResetTransferStats().
+/// All counters are reset on read.
+/// - onboard/offload: transfers between secondary (host) and primary (GPU) memory.
+/// - intraDeviceCopy: GPU-to-GPU block copies (e.g. partial reuse when source block has refs).
+struct KvCacheTransferStats
+{
+    SizeType32 onboardBlocks{0};
+    std::size_t onboardBytes{0};
+    SizeType32 offloadBlocks{0};
+    std::size_t offloadBytes{0};
+    SizeType32 intraDeviceCopyBlocks{0};
+    std::size_t intraDeviceCopyBytes{0};
+};
+
 // The TransferManager accelerates transfers to/from the GPU by overlapping HtoD and DtoH transfers, and tracks ongoing
 // transfers in order to avoid race conditions. It is functionally equivalent to the prior approach of putting all
 // transfers into the forward pass stream. This is only ever used as a component of a KVCacheManager.
@@ -46,8 +60,19 @@ public:
         int numTokensToCopy = 0, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
         std::string const& directory = "");
 
-    //! \brief Synchronize the offload/onboard streams with the bufferManager stream.
+    //! \brief Synchronize internal streams with bufferManager stream.
+    //! \details The buffer manager uses the same stream as the prefill and decode kernels. This method ensures that the
+    //! internal kernels used for offloading and onboarding will wait for prefill and decode kernels before performing
+    //! any block copies. This method must be called before the first call to KVCacheManager::addSequence in every step.
+    void syncWithBufferManager();
+
+    //! \brief Synchronize bufferManager stream with internal streams. This method ensures that prefill and decode
+    //! kernels for next step will wait for offloading and onboarding work that has already been scheduled. This method
+    //! must be called after last call to KVCacheManager::addSequence in every step.
     void syncTransfers();
+
+    //! \brief Get transfer stats accumulated since last call, and reset the counters.
+    [[nodiscard]] KvCacheTransferStats getAndResetTransferStats();
 
 private:
     //! \brief Get pointer to pool specified by cache block.
@@ -71,15 +96,33 @@ private:
         int numTokensToCopy = 0, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
         std::string const& directory = "");
 
+    //! \brief Compute total bytes actually transferred for a block copy across all pools.
+    //! \param pools The pool descriptors.
+    //! \param numTokensToCopy Number of tokens for partial copy (0 means full block).
+    [[nodiscard]] std::size_t computeBlockTransferBytes(
+        std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy) const;
+
     runtime::BufferManager mBufferManager;
     runtime::BufferManager mOnboardManager;
     runtime::BufferManager mOffloadManager;
 
-    // Track the block ids offloaded in this iteration.
-    std::unordered_map<int32_t, tr::CudaEvent> mPendingOffloads;
+    // Track reads and writes for blocks. Note that it is the memory pool index that
+    // identifies the raw memory blocks involved in I/O, not the block Id.
+    std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingReads;
+    std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingWrites;
     // Reference to parent loopback agent
     std::shared_ptr<kvc::BaseLoopbackAgent> mLoopbackAgent;
     int mDeviceId;
+
+    // Cumulative transfer statistics, reset on each call to getAndResetTransferStats().
+    // Protected by mStatsMutex for thread-safe access.
+    mutable std::mutex mStatsMutex;
+    SizeType32 mOnboardBlockCount{0};
+    std::size_t mOnboardByteCount{0};
+    SizeType32 mOffloadBlockCount{0};
+    std::size_t mOffloadByteCount{0};
+    SizeType32 mIntraDeviceCopyBlockCount{0};
+    std::size_t mIntraDeviceCopyByteCount{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

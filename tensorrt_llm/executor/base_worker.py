@@ -2,11 +2,13 @@ import copy
 import datetime
 import enum
 import json
+import os
 import weakref
 from pathlib import Path
 from queue import Queue
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
+import psutil
 import torch
 
 from tensorrt_llm.logger import logger
@@ -19,7 +21,7 @@ from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, logger_debug
+from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
 from ..lora_manager import LoraManager
 from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
@@ -36,9 +38,35 @@ from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     is_llm_response)
 
+if TYPE_CHECKING:
+    from ..disaggregated_params import DisaggregatedParams
+
 __all__ = [
     "BaseWorker",
+    "_init_hf_modules",
 ]
+
+
+def _init_hf_modules():
+    """Initialize cached HuggingFace modules for models with trust_remote_code=True.
+
+    This is safe to call multiple times (idempotent) and should be called:
+    1. At module import time (for main process and spawned subprocesses)
+    2. At worker_main entry (for forked processes or external MPI ranks)
+
+    References: https://github.com/vllm-project/vllm/pull/871
+    """
+    try:
+        from transformers.dynamic_module_utils import init_hf_modules
+        init_hf_modules()
+        logger.debug("HF modules initialized")
+    except ImportError as e:
+        logger.warning(f"ImportError initializing HF modules: {e}")
+    except Exception as e:
+        logger.error(f"Exception initializing HF modules: {e}")
+
+
+_init_hf_modules()
 
 
 class BaseWorker(GenerationExecutor):
@@ -84,13 +112,64 @@ class BaseWorker(GenerationExecutor):
         # mapping: client_id from Proxy -> request_id returned from runtime backend
         self._client_id_to_request_id: Dict[int, int] = {}
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
-        self._is_pytorch_backend = llm_args is not None and llm_args.backend in [
-            "pytorch", "_autodeploy"
-        ]
+        self._backend = None if llm_args is None else llm_args.backend
+        self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
+
+    def _configure_affinity(self, device_id):
+        '''Probe and configure the CPU affinity of the worker based on NUMA topology.
+
+        Args:
+            device_id: The CUDA device ID to determine optimal CPU affinity.
+
+        Note:
+            If the process already has constrained affinity, a warning is logged.
+            Configuration is handled as follows:
+                TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
+                    -> Affinity is automatically configured if it is unconstrained,
+                       and deleted if it is constrained externally by the user.
+                TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
+                    -> Affinity is unconditionally auto-configured.
+                TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
+                    -> Affinity is unconditionally _not_ auto-configured.
+        '''
+
+        # Get the current affinity setting
+        pid = os.getpid()
+        process = psutil.Process(pid)
+        cpu_affinity = process.cpu_affinity()
+
+        all_cpus = list(range(psutil.cpu_count()))
+
+        constrained_affinity = (cpu_affinity != all_cpus)
+        numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
+
+        # If affinity is constrained but the user hasn't explicitly
+        # requested NUMA-aware affinity, remove the constraints.
+        if constrained_affinity:
+            logger.warning(
+                f"Worker process {pid} is affined to run on the following CPUs: "
+                f"{cpu_affinity} (subset of all logical CPUs). This may harm "
+                f"performance if set incorrectly.")
+            if numa_aware_affinity is None:
+                logger.warning(
+                    f"Worker process {pid} has constrained CPU affinity "
+                    f"but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. "
+                    f"Removing CPU affinity constraints.")
+                process.cpu_affinity(all_cpus)
+
+        # If affinity is unconstrained and the user hasn't explicitly
+        # prohibited it or the user has explicitly requested it, choose the
+        # optimal affinity based upon the NUMA topology
+        if ((numa_aware_affinity is None and not constrained_affinity)
+                or (numa_aware_affinity == "1")):
+            process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
+            logger.info(
+                f"Worker process {pid} CPU affinity set to "
+                f"{process.cpu_affinity()} for optimal NUMA-aware scheduling.")
 
     def _get_comm_ranks_device_id(self):
         device_id = self.global_rank % torch.cuda.device_count()
@@ -99,6 +178,9 @@ class BaseWorker(GenerationExecutor):
         global_rank = global_mpi_rank()
         comm_ranks = mpi_comm().allgather(global_rank)
         device_ids = mpi_comm().allgather(device_id)
+
+        self._configure_affinity(device_id)
+
         return comm_ranks, device_ids
 
     def setup_engine(self):
@@ -115,37 +197,38 @@ class BaseWorker(GenerationExecutor):
                 self.llm_args, "backend"
             ), "llm_args should be with backend in _create_py_executor"
             _ = self._get_comm_ranks_device_id()
-            if self.llm_args.backend == "pytorch":
+            if self._backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
                 create_executor = create_py_executor
                 args["llm_args"] = self.llm_args
                 args["checkpoint_dir"] = self._hf_model_dir
                 args["tokenizer"] = self._tokenizer
-            elif self.llm_args.backend == "_autodeploy":
+            elif self._backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.llm_args import \
                     LlmArgs as ADLlmArgs
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
                 create_executor = create_autodeploy_executor
                 assert isinstance(self.llm_args, ADLlmArgs)
-                args["ad_config"] = self.llm_args.get_pytorch_backend_config()
+                args["ad_config"] = self.llm_args
+                args["tokenizer"] = self._tokenizer
             else:
-                raise ValueError(
-                    f"Unsupported backend config: {self.llm_args.backend}")
+                raise ValueError(f"Unsupported backend config: {self._backend}")
 
             # Define additional attributes that can be used later, such as in _deduce_max_tokens
             self.mapping = self.llm_args.parallel_config.to_mapping()
             self.checkpoint_loader = None
-            if self.llm_args.backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.config import \
+            if self._backend == "pytorch":
+                from tensorrt_llm._torch.pyexecutor.model_loader import \
                     _construct_checkpoint_loader
                 self.checkpoint_loader = _construct_checkpoint_loader(
                     self.llm_args.backend, self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format)
 
-            _executor = create_executor(**args)
             self.max_seq_len = self.llm_args.max_seq_len
+            # creare_py_executor may change some fields of llm_args
+            _executor = create_executor(**args)
             if _executor.max_seq_len is not None:
                 # max_seq_len might be updated by model engine as in create_py_executor
                 self.max_seq_len = _executor.max_seq_len
@@ -202,9 +285,7 @@ class BaseWorker(GenerationExecutor):
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
 
-        if self.llm_args and getattr(
-                self.llm_args, "backend",
-                "") == "pytorch" and self._lora_config is not None:
+        if self._backend == "pytorch" and self._lora_config is not None:
             from tensorrt_llm._torch.pyexecutor.resource_manager import \
                 ResourceManagerType
             peft_cache_manager = self.engine.resource_manager.resource_managers.get(
@@ -223,7 +304,7 @@ class BaseWorker(GenerationExecutor):
             iter_stats = self.engine.get_latest_iteration_stats()
             #TODO: Support req stats with TRT engine
             #      This would require ensuring iter and req stats have same size
-            return [(iter_stat, None) for iter_stat in iter_stats]
+            return [(iter_stat, None, None) for iter_stat in iter_stats]
         else:
             return self.engine.get_latest_iteration_stats()
 
@@ -349,12 +430,16 @@ class BaseWorker(GenerationExecutor):
                     multimodal_positions=request.multimodal_params.
                     multimodal_input.multimodal_positions,
                     multimodal_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_lengths)
+                    multimodal_input.multimodal_lengths,
+                    multimodal_uuids=request.multimodal_params.multimodal_input.
+                    multimodal_uuids)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 
         context_phase_params = None
         request_type = tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
+        disagg_request_id = 0
+
         if request.disaggregated_params is not None:
             assert (
                 not self._is_pytorch_backend
@@ -363,19 +448,10 @@ class BaseWorker(GenerationExecutor):
                 == "context_and_generation"
             ), "kv_cache_transceiver is disabled, please set 'cache_transceiver_config: backend:<backend_type>` in config file for disaggregated serving"
             request_type = request.disaggregated_params.get_request_type()
+            disagg_request_id = request.disaggregated_params.disagg_request_id
             if request_type == tllm.RequestType.REQUEST_TYPE_GENERATION_ONLY:
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
-
-        if self._is_pytorch_backend:
-            if not self.llm_args.disable_overlap_scheduler:
-                is_disaggregated = self.engine.kv_cache_transceiver is not None
-                if is_disaggregated and (
-                        request_type
-                        == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY):
-                    raise ValueError(
-                        "Context only requests are not supported in pytorch backend when overlap is enabled."
-                    )
 
         assert request.id is not None
 
@@ -418,25 +494,27 @@ class BaseWorker(GenerationExecutor):
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
             default_max_tokens = max_seq_len - splited_prompt_len - query_token_len
             if default_max_tokens <= 0:
-                logger.warning(
-                    f"`default_max_tokens` ({default_max_tokens}) should be greater than 0, "
+                # Raise error on `default_max_tokens` not enough, since max_tokens should be less than `default_max_tokens``
+                raise ValueError(
+                    f"`default_max_tokens` ({default_max_tokens}) must be greater than 0, "
                     f"`default_max_tokens` ({default_max_tokens}) = max_seq_len ({max_seq_len})"
                     f" - `splited_prompt_len` ({splited_prompt_len}) - `query_token_len` ({query_token_len})"
                 )
-                if max_tokens is None:
-                    raise ValueError(
-                        "`max_tokens` must be set when `default_max_tokens` is illegal"
-                    )
+
             # default_max_tokens is the biggest available value
             if max_tokens is None:
                 return default_max_tokens
-            elif max_tokens > default_max_tokens:
+            elif max_tokens > default_max_tokens and default_max_tokens > 0:
                 logger.warning(
                     f"User-specified `max_tokens` ({max_tokens}) is greater than deduced "
                     f"`default_max_tokens` ({default_max_tokens}), using default_max_tokens instead."
                 )
                 return default_max_tokens
-            return max_tokens
+            elif max_tokens <= 0:
+                raise ValueError(
+                    f"`max_tokens` ({max_tokens}) must be greater than 0")
+            else:
+                return max_tokens
 
         try:
             executor_request = tllm.Request(
@@ -461,7 +539,8 @@ class BaseWorker(GenerationExecutor):
                 guided_decoding_params=request.sampling_params.
                 _get_guided_decoding_params(),
                 bad_words=request.sampling_params._get_bad_words(),
-                stop_words=request.sampling_params._get_stop_words(),
+                stop_words=[] if request.sampling_params.ignore_eos else
+                request.sampling_params._get_stop_words(),
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
@@ -478,10 +557,17 @@ class BaseWorker(GenerationExecutor):
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type,
-                cache_salt_id=request.cache_salt_id)
+                cache_salt_id=request.cache_salt_id,
+                disagg_request_id=disagg_request_id,
+                priority=request.priority)
+            executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
+            executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
 
+            # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
+            if self._is_pytorch_backend and request.disaggregated_params is not None:
+                executor_request.py_disaggregated_params = request.disaggregated_params
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
                     # NOTE: Deserialize SharedTensor handle to actual tensor
@@ -567,11 +653,17 @@ class BaseWorker(GenerationExecutor):
             self.engine.shutdown()
             self.engine = None
 
+    def get_disaggregated_params(self) -> dict:
+        if self.engine is None or self.engine.kv_cache_transceiver is None:
+            logger.warning("Engine or kv cache transceiver is not initialized")
+            return {}
+        return self.engine.kv_cache_transceiver.get_disaggregated_params()
+
     # Define a Callable to join iteration and request stats
     @staticmethod
-    def _stats_serializer(
-            stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
-        iteration_stats, req_stats = stats
+    def _stats_serializer(stats) -> str:
+        iteration_stats, req_stats = stats[0], stats[1]
+        kv_iter_stats = stats[2] if len(stats) > 2 else None
         stats_dict = json.loads(iteration_stats.to_json_str())
 
         if req_stats is not None and len(req_stats) > 0:
@@ -579,6 +671,35 @@ class BaseWorker(GenerationExecutor):
             for req_stat in req_stats:
                 stats_dict["requestStats"].append(
                     json.loads(req_stat.to_json_str()))
+
+        # Inject per-iteration KV cache stats (keyed by window size)
+        if kv_iter_stats is not None:
+            stats_dict["kvCacheIterationStats"] = {
+                str(window_size): {
+                    "primaryMaxNumBlocks": s.primary_max_num_blocks,
+                    "primaryFreeNumBlocks": s.primary_free_num_blocks,
+                    "primaryUsedNumBlocks": s.primary_used_num_blocks,
+                    "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
+                    "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
+                    "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
+                    "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
+                    "iterAllocNewBlocks": s.iter_alloc_new_blocks,
+                    "iterReusedBlocks": s.iter_reused_blocks,
+                    "iterFullReusedBlocks": s.iter_full_reused_blocks,
+                    "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
+                    "iterMissedBlocks": s.iter_missed_blocks,
+                    "iterCacheHitRate": s.iter_cache_hit_rate,
+                    "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
+                    "iterOnboardBlocks": s.iter_onboard_blocks,
+                    "iterOnboardBytes": s.iter_onboard_bytes,
+                    "iterOffloadBlocks": s.iter_offload_blocks,
+                    "iterOffloadBytes": s.iter_offload_bytes,
+                    "iterIntraDeviceCopyBlocks":
+                    s.iter_intra_device_copy_blocks,
+                    "iterIntraDeviceCopyBytes": s.iter_intra_device_copy_bytes,
+                }
+                for window_size, s in kv_iter_stats.items()
+            }
 
         # Convert back to JSON string
         return json.dumps(stats_dict)
@@ -736,14 +857,15 @@ class AwaitResponseHelper:
 
 
 def _get_params_for_first_rsp(
-        worker,
-        client_id) -> Tuple[Optional[SamplingParams], Optional[PostprocParams]]:
+    worker, client_id
+) -> Tuple[Optional[SamplingParams], Optional[PostprocParams],
+           Optional["DisaggregatedParams"]]:
     res = worker._results.get(client_id, None)
     assert res is not None
     if not res._params_transmitted:
         res._params_transmitted = True
-        return res.sampling_params, res.postproc_params
-    return None, None
+        return res.sampling_params, res.postproc_params, res.disaggregated_params
+    return None, None, None
 
 
 def _compute_pytorch_prompt_logprobs(
@@ -759,9 +881,19 @@ def _compute_pytorch_prompt_logprobs(
                 prompt=cached, generation=None
             )  # generation logprobs, if requested, is provided directly in response.result.log_probs from the sampler.
     context_logits = response.result.context_logits
-    assert context_logits is not None, "context_logits cannot be None when prompt_logprobs is requested."
+    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
+    result = response.result.get_result()
+    assert result is not None, "result must not be None when prompt_logprobs is requested."
+    # Single element list
+    first_generation_token = result.output_token_ids[0][:1]
+    assert first_generation_token, "first generation token must not be empty when prompt_logprobs is requested."
+    # Pass prompt_token_ids with an offset of 1 for correct mapping to the context logits
+    prompt_token_ids = generation_result._generation_request.prompt_token_ids[
+        1:] + first_generation_token
+
     logprobs_result = compute_logprobs(logprob_params.prompt_logprobs, None,
-                                       context_logits, None, None)
+                                       context_logits, None, None,
+                                       prompt_token_ids)
     if generation_result._streaming:
         generation_result._cached_prompt_logprobs = logprobs_result.prompt
 
@@ -787,7 +919,7 @@ def _get_logprobs(worker,
     logprob_params = getattr(generation_result, "_logprob_params", None)
     if logprob_params:
         if is_pytorch_backend:
-            if not logprob_params.prompt_logprobs:
+            if logprob_params.prompt_logprobs is None:
                 # PyTorch: generation logprobs computed in sampler, no post-processing needed
                 return None
             else:
@@ -831,8 +963,8 @@ def _send_rsp(
         else:
             worker.result_queue.put(response)
     else:
-        sampling_params, postproc_params = _get_params_for_first_rsp(
-            worker, response.client_id)
+        sampling_params, postproc_params, disaggregated_params = (
+            _get_params_for_first_rsp(worker, response.client_id))
         inp = PostprocWorker.Input(
             response,
             # sampling_params is necessary for creating fake GenerationResult
@@ -841,6 +973,7 @@ def _send_rsp(
             # Request.
             sampling_params=sampling_params,
             postproc_params=postproc_params,
+            disaggregated_params=disaggregated_params,
             streaming=worker._results.get(response.client_id, None)._streaming)
 
         pid = response.client_id % worker.postproc_config.num_postprocess_workers

@@ -1,3 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 """The model factory interface used by auto-deploy to build custom models."""
 
 import copy
@@ -10,9 +26,6 @@ import torch.nn as nn
 from torch._prims_common import DeviceLikeType
 from torch.export import Dim
 from torch.fx import GraphModule
-
-from ..custom_ops.attention_interface import CacheConfig
-from ..utils.logger import ad_logger
 
 DynamicShape = Dict[int, Dim]  # indicating the dynamic shape in tensor dimension
 
@@ -107,7 +120,7 @@ class ModelFactory(ABC):
         tokenizer: Optional[str] = None,
         tokenizer_kwargs: Optional[Dict[str, Any]] = None,
         skip_loading_weights: bool = False,
-        max_seq_len: int = 512,
+        max_seq_len: Optional[int] = None,
         **kwargs,
     ):
         self._model = model
@@ -115,7 +128,7 @@ class ModelFactory(ABC):
         self._tokenizer = tokenizer
         self.tokenizer_kwargs = copy.deepcopy(tokenizer_kwargs or {})
         self.skip_loading_weights = skip_loading_weights
-        self.max_seq_len = max_seq_len
+        self._max_seq_len = max_seq_len
         self._prefetched_model_path: Optional[str] = None
         self._prefetched_tokenizer_path: Optional[str] = None
         self._sharding_config: Dict[str, Any] = {}
@@ -130,6 +143,23 @@ class ModelFactory(ABC):
     def tokenizer(self) -> Optional[str]:
         """The tokenizer path."""
         return self._prefetched_tokenizer_path or self._tokenizer or self.model
+
+    @property
+    @abstractmethod
+    def max_seq_len(self) -> int:
+        """The maximum sequence length."""
+
+    @property
+    def vocab_size_padded(self) -> Optional[int]:
+        """Return the padded vocabulary size of the model.
+
+        This is needed for guided decoding in the pyexecutor. If the factory does not support this,
+        then this method should return None.
+
+        Returns:
+            The padded vocabulary size of the model.
+        """
+        return None
 
     def build_model(self, device: str) -> nn.Module:
         """Build the model on the desired device.
@@ -164,10 +194,7 @@ class ModelFactory(ABC):
         the factory.
         """
         # make sure model architecture is pre-fetched (no weights needed at this point)
-        skip_loading_weights = self.skip_loading_weights
-        self.skip_loading_weights = True
-        self.prefetch_checkpoint()
-        self.skip_loading_weights = skip_loading_weights
+        self.prefetch_checkpoint(skip_loading_weights=True)
 
         # build the model
         return self._build_model(device)
@@ -185,13 +212,15 @@ class ModelFactory(ABC):
         """Returns the sharding config for this model."""
         return self._sharding_config
 
-    def get_cache_config(self) -> CacheConfig:
-        """Return the cache configuration for the model.
+    def get_cache_config_updates(self) -> Dict[str, Any]:
+        """Return updates for the KVCacheConfig for the model.
 
         Returns:
-            The cache configuration for the model.
+            A dictionary of updates for the KVCacheConfig for the model.
+
+        Check tensorrt_llm/llmapi/llm_args.py for the KVCacheConfig fields.
         """
-        return CacheConfig()
+        return {}
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer for the model.
@@ -211,15 +240,18 @@ class ModelFactory(ABC):
         """
         return None
 
-    def prefetch_checkpoint(self, force: bool = False):
+    def prefetch_checkpoint(self, force: bool = False, skip_loading_weights: Optional[bool] = None):
         """Try or skip prefetching the checkpoint for the model and tokenizer.
 
         Args:
             force: Whether to force prefetching the checkpoint.
+            skip_loading_weights: Whether to skip loading weights. If not provided, it will use
+                the factory's skip_loading_weights value.
         """
         if not self._prefetched_model_path or force:
             self._prefetched_model_path = self._prefetch_checkpoint(
-                self._model, self.skip_loading_weights
+                self._model,
+                self.skip_loading_weights if skip_loading_weights is None else skip_loading_weights,
             )
         if self._tokenizer and (not self._prefetched_tokenizer_path or force):
             self._prefetched_tokenizer_path = self._prefetch_checkpoint(self._tokenizer, True)
@@ -236,7 +268,9 @@ class ModelFactory(ABC):
         """
         return model_name_or_path
 
-    def load_or_random_init(self, model: nn.Module, device: DeviceLikeType):
+    def load_or_random_init(
+        self, model: nn.Module, device: DeviceLikeType, disable_preload: bool = False
+    ):
         """Load the checkpoint into the model or randomly initialize the model.
 
         Args:
@@ -244,6 +278,7 @@ class ModelFactory(ABC):
                 the same model that is built above but it needs to have a state dict compatible with
                 the model built above.
             device: The device to load the model on.
+            disable_preload: If True, disable preloading weights to CPU before moving to device.
             load_factoy_model: If True, will load weights for the factory model in addition to main
                 gm. This is useful for the transformers model.
 
@@ -272,12 +307,11 @@ class ModelFactory(ABC):
                     <SIZE_OF_LARGEST_CHECKPOINT_FILE>
 
         """
-        ad_logger.info("Loading and initializing weights.")
         self._to_maybe_random(model, device)
+
         if not self.skip_loading_weights:
             self.prefetch_checkpoint(force=True)
-            self._load_checkpoint(model, device)
-        ad_logger.info("Loading and initializing weights. Done.")
+            self._load_checkpoint(model, device, disable_preload=disable_preload)
 
     @staticmethod
     def _to_maybe_random(model: nn.Module, device: DeviceLikeType):
@@ -297,7 +331,9 @@ class ModelFactory(ABC):
         )
 
     @abstractmethod
-    def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
+    def _load_checkpoint(
+        self, model: nn.Module, device: DeviceLikeType, disable_preload: bool = False
+    ):
         """Load the checkpoint into the model.
 
         Args:
@@ -305,6 +341,7 @@ class ModelFactory(ABC):
                 the same model that is built above but it needs to have a state dict compatible with
                 the model built above.
             device: The device to load the model on.
+            disable_preload: If True, disable preloading weights to CPU before moving to device.
         """
 
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:

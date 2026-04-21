@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,6 +47,8 @@ using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunner;
 using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunnerInterface;
 #endif
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -60,7 +62,9 @@ tkc::CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k, FP4
     {
         if (sm >= 120)
         {
-            return tkc::CutlassGemmConfig(tkc::CutlassTileConfigSM120::CtaShape128x128x256B,
+            // Use the smallest SM120 tile as default; the autotuner will select
+            // the optimal config (including larger tiles) for the current device.
+            return tkc::CutlassGemmConfig(tkc::CutlassTileConfigSM120::CtaShape128x128x128B,
                 tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO,
                 tkc::ClusterShape::ClusterShape_1x1x1);
         }
@@ -310,12 +314,14 @@ private:
 };
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.class_<torch_ext::FP4GemmRunner>("FP4GemmRunner")
+    m.class_<tensorrt_llm::torch_ext::FP4GemmRunner>("FP4GemmRunner")
         .def(torch::init<at::ScalarType, int64_t>())
-        .def("run_gemm", &torch_ext::FP4GemmRunner::runGemm)
-        .def("get_num_configs", &torch_ext::FP4GemmRunner::getNumConfigs);
+        .def("run_gemm", &tensorrt_llm::torch_ext::FP4GemmRunner::runGemm)
+        .def("get_num_configs", &tensorrt_llm::torch_ext::FP4GemmRunner::getNumConfigs);
 
     m.def(
         "fp4_bmm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor globalScale, int fp4GemmType, "
@@ -327,6 +333,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp4_bmm", &torch_ext::fp4_bmm);
-    m.impl("fp4_gemm", &torch_ext::fp4_bmm);
+    m.impl("fp4_bmm", &tensorrt_llm::torch_ext::fp4_bmm);
+    m.impl("fp4_gemm", &tensorrt_llm::torch_ext::fp4_bmm);
 }

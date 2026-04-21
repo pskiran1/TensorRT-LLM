@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -56,29 +57,49 @@ using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 class TransferSession
 {
 public:
+    // measures for each single transmission
     struct Measure
     {
-        double delay;     // from last token (ctx) or arrival time (gen), in ms
-        double duration;  // in ms
-        double bandwidth; // in Gbps
+        LlmRequest::TimePoint start;
+        LlmRequest::TimePoint end;
+        size_t size = 0;
+    };
+
+    enum TimeNames : uint8_t
+    {
+        kTimeRequestInfo = 0,
+        kTimeFormatter,
+        kTimePreprocess,
+        kTimeTransmissions,
+        kTimePostprocess,
+        kTimeCounts
+    };
+
+    struct KVCacheTimes
+    {
+        std::array<LlmRequest::TimePoint, kTimeCounts> times;
+        std::vector<Measure> measures;
     };
 
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
-        executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
-        runtime::BufferManager const& bufferManager, int32_t indexFromEnd, BlockKey const& lastBlockKey,
-        LlmRequest const* llmRequest = nullptr, bool recordMeasure = false)
+        std::vector<SizeType32> counterPartRanks, executor::DataTransceiverState const& selfState,
+        executor::DataTransceiverState otherState, runtime::BufferManager const& bufferManager, int32_t indexFromEnd,
+        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
         : mConnections(std::move(connections))
+        , mCounterPartRanks(std::move(counterPartRanks))
         , mDataContext(std::move(dataContext))
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
         , mRequest(llmRequest)
-        , mMeasures()
-        , mRecordMeasure(recordMeasure)
         , mIndexFromEnd(indexFromEnd)
         , mLastBlockKey(lastBlockKey)
     {
         TLLM_CHECK(!mConnections.empty());
+        if (recordTiming)
+        {
+            mTimes = std::make_unique<KVCacheTimes>();
+        }
     }
 
     [[nodiscard]] std::vector<Connection const*> const& getConnections() const;
@@ -103,7 +124,9 @@ public:
     // in CacheSender, the LlmRequest is not available until the sendSync is called
     void setLlmRequest(LlmRequest const& llmRequest);
 
-    void appendMeasure(double delay, double duration, size_t size);
+    void setTime(TimeNames name);
+
+    void appendMeasure(LlmRequest::TimePoint start, LlmRequest::TimePoint end, size_t size);
 
     // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
     void exportMeasure(std::ofstream& outFile, bool isContext) const;
@@ -118,15 +141,25 @@ public:
         return mLastBlockKey;
     }
 
+    [[nodiscard]] std::vector<SizeType32> const& getCounterPartRanks() const
+    {
+        return mCounterPartRanks;
+    }
+
+    void setCounterPartRanks(std::vector<SizeType32> ranks)
+    {
+        mCounterPartRanks = std::move(ranks);
+    }
+
 private:
     std::vector<Connection const*> mConnections;
+    std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
     DataContext mDataContext;
     executor::DataTransceiverState const* mSelfState; // stored in CacheReceiver/CacheSender
     executor::DataTransceiverState mOtherState;
     runtime::BufferManager const* mBufferManager;
     LlmRequest const* mRequest;
-    std::vector<Measure> mMeasures;
-    bool mRecordMeasure{false};
+    std::unique_ptr<KVCacheTimes> mTimes;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
 };
@@ -215,8 +248,10 @@ class CacheSender
 {
 public:
     /// @brief Constructor.
-    CacheSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
+    /// @param manager The connection manager.
+    /// @param selfIndex The sequential index of the current executor process.
+    /// @param cacheLayer The cache layer bundling all cache states and formatters.
+    CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
 
     CacheSender() = default;
 
@@ -270,8 +305,10 @@ class CacheReceiver
 {
 public:
     /// @brief Constructor.
-    CacheReceiver(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
+    /// @param manager The connection manager.
+    /// @param selfIndex The sequential index of the current executor process.
+    /// @param cacheLayer The cache layer bundling all cache states and formatters.
+    CacheReceiver(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
 
     CacheReceiver() = default;
 

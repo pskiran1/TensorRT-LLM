@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include <atomic>
 #include <cooperative_groups.h>
 #include <cub/cub.cuh>
@@ -24,8 +25,8 @@
 
 namespace cg = cooperative_groups;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -145,10 +146,6 @@ void moeSetSignalForCpuStageForTest(MoeLoadBalanceSingleLayerSignal* signal)
 template <typename TYPE>
 __global__ void zeroExpertTokenCountKernel(MoeLoadBalanceMetaInfo metaInfo, int* const enabled, int* expertTokenCount)
 {
-    if (*enabled == 0)
-    {
-        return;
-    }
     TYPE oldExpertTokenCount = {0};
     int* expertTokenCountPtr = expertTokenCount + metaInfo.expertCount * blockIdx.x;
     TYPE* typedExpertTokenCountPtr = reinterpret_cast<TYPE*>(expertTokenCountPtr);
@@ -669,4 +666,5 @@ void moeSetSignalForGpuStageHost(MoeLoadBalanceSingleLayerSignal* signal, int64_
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END
